@@ -973,7 +973,7 @@ impl DistributedRuntime {
         self.inner.system_status_server_info().map(|info| {
             let socket_addr = info.socket_addr;
             if socket_addr.ip().is_unspecified() {
-                let host = dynamo_runtime::utils::ip_resolver::get_local_ip_for_advertise();
+                let host = dynamo_runtime::utils::ip_resolver::local_ip_for_advertise();
                 format!("http://{host}:{}", socket_addr.port())
             } else {
                 format!("http://{socket_addr}")
