@@ -129,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routes_request_describes_the_worker_engine_surface() {
+    fn rl_dispatch_only_describes_the_worker_engine_surface() {
         let routes = EngineRouteRegistry::new();
         routes.register(
             "control/pause_generation",
@@ -147,6 +147,10 @@ mod tests {
                 "routes": ["control/pause_generation"],
                 "system_url": "http://worker:8080",
             })
+        );
+        assert_eq!(
+            handler.dispatch(&json!({"method": "control/pause_generation"}))["status"],
+            "error"
         );
     }
 }

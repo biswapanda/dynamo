@@ -46,8 +46,6 @@ struct FakeVllm {
     release_first_token: Arc<Notify>,
     server_stream_dropped: Arc<AtomicBool>,
     control_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
-    paused: Arc<AtomicBool>,
-    sleeping: Arc<AtomicBool>,
     weight_version: Arc<Mutex<String>>,
 }
 
@@ -275,7 +273,6 @@ impl pb::control_server::Control for FakeVllm {
         request: Request<pb::PauseGenerationRequest>,
     ) -> Result<Response<pb::PauseGenerationResponse>, Status> {
         let request = request.into_inner();
-        self.paused.store(true, Ordering::SeqCst);
         self.record_control(
             "pause_generation",
             json!({"mode": request.mode, "clear_cache": request.clear_cache}),
@@ -288,51 +285,35 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         _request: Request<pb::ResumeGenerationRequest>,
     ) -> Result<Response<pb::ResumeGenerationResponse>, Status> {
-        self.paused.store(false, Ordering::SeqCst);
-        self.record_control("resume_generation", json!({})).await;
-        Ok(Response::new(pb::ResumeGenerationResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn is_paused(
         &self,
         _request: Request<pb::IsPausedRequest>,
     ) -> Result<Response<pb::IsPausedResponse>, Status> {
-        Ok(Response::new(pb::IsPausedResponse {
-            paused: self.paused.load(Ordering::SeqCst),
-        }))
+        unimplemented_rl_rpc()
     }
 
     async fn sleep(
         &self,
-        request: Request<pb::SleepRequest>,
+        _request: Request<pb::SleepRequest>,
     ) -> Result<Response<pb::SleepResponse>, Status> {
-        let request = request.into_inner();
-        self.sleeping.store(true, Ordering::SeqCst);
-        self.record_control(
-            "sleep",
-            json!({"level": request.level, "mode": request.mode}),
-        )
-        .await;
-        Ok(Response::new(pb::SleepResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn wake_up(
         &self,
-        request: Request<pb::WakeUpRequest>,
+        _request: Request<pb::WakeUpRequest>,
     ) -> Result<Response<pb::WakeUpResponse>, Status> {
-        self.sleeping.store(false, Ordering::SeqCst);
-        self.record_control("wake_up", json!({"tags": request.into_inner().tags}))
-            .await;
-        Ok(Response::new(pb::WakeUpResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn is_sleeping(
         &self,
         _request: Request<pb::IsSleepingRequest>,
     ) -> Result<Response<pb::IsSleepingResponse>, Status> {
-        Ok(Response::new(pb::IsSleepingResponse {
-            sleeping: self.sleeping.load(Ordering::SeqCst),
-        }))
+        unimplemented_rl_rpc()
     }
 
     async fn init_weight_transfer_engine(
@@ -350,17 +331,14 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         _request: Request<pb::StartWeightUpdateRequest>,
     ) -> Result<Response<pb::StartWeightUpdateResponse>, Status> {
-        self.record_control("start_weight_update", json!({})).await;
-        Ok(Response::new(pb::StartWeightUpdateResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn start_draft_weight_update(
         &self,
         _request: Request<pb::StartDraftWeightUpdateRequest>,
     ) -> Result<Response<pb::StartDraftWeightUpdateResponse>, Status> {
-        self.record_control("start_draft_weight_update", json!({}))
-            .await;
-        Ok(Response::new(pb::StartDraftWeightUpdateResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn update_weights(
@@ -388,13 +366,9 @@ impl pb::control_server::Control for FakeVllm {
 
     async fn update_weight_version(
         &self,
-        request: Request<pb::UpdateWeightVersionRequest>,
+        _request: Request<pb::UpdateWeightVersionRequest>,
     ) -> Result<Response<pb::UpdateWeightVersionResponse>, Status> {
-        let version = request.into_inner().weight_version;
-        self.weight_version.lock().await.clone_from(&version);
-        self.record_control("update_weight_version", json!({"new_version": version}))
-            .await;
-        Ok(Response::new(pb::UpdateWeightVersionResponse {}))
+        unimplemented_rl_rpc()
     }
 
     async fn get_weight_version(
@@ -405,6 +379,13 @@ impl pb::control_server::Control for FakeVllm {
             weight_version: self.weight_version.lock().await.clone(),
         }))
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn unimplemented_rl_rpc<T>() -> Result<Response<T>, Status> {
+    Err(Status::unimplemented(
+        "RL RPC is outside this test's contract",
+    ))
 }
 
 fn model_info() -> pb::ModelInfo {
@@ -744,7 +725,6 @@ async fn engine_from_args(
         "5".to_string(),
         "--grpc-connect-attempt-timeout-secs".to_string(),
         "1".to_string(),
-        "--enable-rl".to_string(),
     ];
     tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
         .await
@@ -811,7 +791,6 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let (engine, worker) = engine_from_args(&server.endpoint).await;
     assert_eq!(worker.model_name, "model-source");
     assert_eq!(worker.served_model_name.as_deref(), Some("served-model"));
-    assert!(worker.enable_rl);
     assert!(worker.reasoning_parser.is_none());
     assert!(worker.tool_call_parser.is_none());
     let config = engine.start(0).await.expect("start");
@@ -921,20 +900,6 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
     );
     engine.start(0).await.expect("start");
 
-    assert!(
-        engine
-            .supported_controls()
-            .await
-            .unwrap()
-            .contains(&"pause_generation".to_string())
-    );
-    assert!(
-        engine
-            .supported_updates()
-            .await
-            .unwrap()
-            .contains(&"update_weights".to_string())
-    );
     assert_eq!(
         engine
             .engine_control(
@@ -950,10 +915,6 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
             "init_weight_transfer_engine".to_string(),
             json!({"init_info": {"master_addr": "trainer", "master_port": 1234}}),
         )
-        .await
-        .unwrap();
-    engine
-        .engine_update("start_weight_update".to_string(), json!({}))
         .await
         .unwrap();
     engine
@@ -989,7 +950,6 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
                 "init_weight_transfer_engine".to_string(),
                 json!({"master_addr": "trainer", "master_port": 1234}),
             ),
-            ("start_weight_update".to_string(), json!({})),
             (
                 "update_weights".to_string(),
                 json!({"names": ["layer.weight"], "shape": [4, 8]}),
