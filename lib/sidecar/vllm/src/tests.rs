@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dynamo_backend_common::engine::RoutingHints;
 use dynamo_backend_common::{
     DisaggregationMode, FinishReason, GenerateContext, LLMEngine, OutputOptions, PrefillResult,
     PreprocessedRequest, SamplingOptions, StopConditions,
@@ -31,6 +32,7 @@ use crate::proto as pb;
 #[derive(Clone, Default)]
 struct FakeVllm {
     requests: Arc<Mutex<Vec<pb::GenerateRequest>>>,
+    data_parallel_rank_metadata: Arc<Mutex<Vec<Option<String>>>>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
     model_info_override: Arc<Mutex<Option<pb::ModelInfo>>>,
     reject: Arc<AtomicBool>,
@@ -38,6 +40,10 @@ struct FakeVllm {
     hang_before_headers: Arc<AtomicBool>,
     headers_pending: Arc<AtomicBool>,
     release_headers: Arc<Notify>,
+    hold_before_first_token: Arc<AtomicBool>,
+    close_before_first_token: Arc<AtomicBool>,
+    first_token_pending: Arc<AtomicBool>,
+    release_first_token: Arc<Notify>,
     server_stream_dropped: Arc<AtomicBool>,
     control_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     paused: Arc<AtomicBool>,
@@ -81,6 +87,16 @@ impl pb::inference_server::Inference for FakeVllm {
         if let Some(peer) = request.remote_addr() {
             self.peers.lock().await.push(peer);
         }
+        let data_parallel_rank = request
+            .metadata()
+            .get("x-data-parallel-rank")
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.data_parallel_rank_metadata
+            .lock()
+            .await
+            .push(data_parallel_rank);
         let request = request.into_inner();
         self.requests.lock().await.push(request.clone());
         if self.hang_before_headers.load(Ordering::SeqCst) {
@@ -133,6 +149,10 @@ impl pb::inference_server::Inference for FakeVllm {
             "nested": {"flags": [true, null, "opaque"]},
         });
         let hang = self.hang.load(Ordering::SeqCst);
+        let hold_before_first_token = self.hold_before_first_token.load(Ordering::SeqCst);
+        let close_before_first_token = self.close_before_first_token.load(Ordering::SeqCst);
+        let first_token_pending = self.first_token_pending.clone();
+        let release_first_token = self.release_first_token.clone();
         let dropped = self.server_stream_dropped.clone();
 
         let stream = async_stream::try_stream! {
@@ -159,6 +179,15 @@ impl pb::inference_server::Inference for FakeVllm {
                 prompt_info: Some(prompt_info),
                 outputs: None,
             };
+
+            if hold_before_first_token {
+                first_token_pending.store(true, Ordering::SeqCst);
+                release_first_token.notified().await;
+                first_token_pending.store(false, Ordering::SeqCst);
+            }
+            if close_before_first_token {
+                return;
+            }
 
             if hang {
                 loop {
@@ -210,7 +239,20 @@ impl pb::control_server::Control for FakeVllm {
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
         Ok(Response::new(pb::GetKvEventSourcesResponse {
-            sources: Vec::new(),
+            sources: (0..2)
+                .map(|rank| pb::KvEventSource {
+                    transport: "zmq".to_string(),
+                    endpoint: format!("tcp://*:{}", 20081 + rank),
+                    topic: String::new(),
+                    replay_endpoint: String::new(),
+                    data_parallel_rank: Some(rank),
+                    encoding: "msgpack".to_string(),
+                    schema_version: 1,
+                    buffer_steps: 0,
+                    hwm: 0,
+                    max_queue_size: 0,
+                })
+                .collect(),
         }))
     }
 
@@ -372,8 +414,8 @@ fn server_info() -> pb::ServerInfo {
         parallelism: Some(pb::ParallelismInfo {
             tensor_parallel_size: 2,
             pipeline_parallel_size: 1,
-            data_parallel_size: 4,
-            data_parallel_rank: 2,
+            data_parallel_size: 2,
+            data_parallel_rank: 0,
             decode_context_parallel_size: 1,
         }),
         max_model_len: 8192,
@@ -381,7 +423,6 @@ fn server_info() -> pb::ServerInfo {
         total_kv_blocks: 4096,
         max_running_requests: 128,
         max_batched_tokens: 2048,
-        supports_explicit_data_parallel_rank: false,
         rl_capabilities: Some(pb::RlCapabilities {
             weight_transfer_enabled: true,
             weight_transfer_backend: "nccl".to_string(),
@@ -626,8 +667,13 @@ fn request() -> PreprocessedRequest {
             prompt_logprobs: Some(1),
             ..Default::default()
         })
-        .mdc_sum(Some("cache-salt".to_string()))
+        .mdc_sum(Some("model-checksum".to_string()))
+        .routing(Some(RoutingHints {
+            cache_namespace: Some("cache-salt".to_string()),
+            ..Default::default()
+        }))
         .extra_args(Some(json!({
+            "nvext": {"cache_salt": "cache-salt", "token_in": true},
             "bypass_prefix_cache": true,
             "kv_transfer_params": {
                 "connector_data": {"values": [1, true, null]}
@@ -635,6 +681,22 @@ fn request() -> PreprocessedRequest {
         })))
         .build()
         .expect("request")
+}
+
+fn decode_request() -> PreprocessedRequest {
+    let mut request = request();
+    request.prefill_result = Some(PrefillResult {
+        disaggregated_params: json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_engine_id": "prefill-0",
+            "remote_host": "127.0.0.1",
+            "remote_port": 20097,
+            "remote_block_ids": [7, 8],
+        }),
+        prompt_tokens_details: None,
+    });
+    request
 }
 
 fn engine(endpoint: &str, mode: DisaggregationMode, connections: usize) -> VllmSidecarEngine {
@@ -685,6 +747,45 @@ async fn collect(
         .await
 }
 
+#[test]
+fn discovery_rejects_incompatible_model_metadata() {
+    let mut unsupported_api = server_info();
+    unsupported_api.api_version = "unsupported".to_string();
+
+    let mut missing_model_id = model_info();
+    missing_model_id.model_id.clear();
+
+    let mut missing_served_name = model_info();
+    missing_served_name.served_model_name.clear();
+
+    let mut unsupported_input = model_info();
+    unsupported_input.supports_token_ids_input = false;
+
+    for (case, model, server) in [
+        ("unsupported API", model_info(), unsupported_api),
+        ("missing model ID", missing_model_id, server_info()),
+        ("missing served name", missing_served_name, server_info()),
+        ("unsupported input", unsupported_input, server_info()),
+    ] {
+        assert!(
+            DiscoveredModel::from_proto(model, server).is_err(),
+            "{case} metadata should be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn startup_rejects_model_identity_change_after_bootstrap() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let (engine, _) = engine_from_args(&server.endpoint).await;
+
+    let mut changed = model_info();
+    changed.served_model_name = "changed-served-model".to_string();
+    *server.service.model_info_override.lock().await = Some(changed);
+
+    assert!(engine.start(0).await.is_err());
+}
+
 #[tokio::test]
 async fn aggregated_generation_converts_request_stream_and_usage() {
     let server = FakeServer::start(FakeVllm::default()).await;
@@ -697,16 +798,47 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let config = engine.start(0).await.expect("start");
     assert_eq!(config.model, "model-source");
     assert_eq!(config.served_model_name.as_deref(), Some("served-model"));
+    assert_eq!(config.model_aliases, ["model-alias"]);
     let registration = config.llm.expect("LLM registration");
     assert_eq!(registration.context_length, Some(8192));
     assert_eq!(registration.kv_cache_block_size, Some(16));
     assert_eq!(registration.total_kv_blocks, Some(4096));
     assert_eq!(registration.max_num_seqs, Some(128));
     assert_eq!(registration.max_num_batched_tokens, Some(2048));
-    assert_eq!(registration.data_parallel_size, None);
-    assert_eq!(registration.data_parallel_start_rank, None);
+    assert_eq!(registration.data_parallel_size, Some(2));
+    assert_eq!(registration.data_parallel_start_rank, Some(0));
 
-    let outputs = collect(&engine, request()).await;
+    let sources = engine.kv_event_sources().await.expect("KV event sources");
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        sources
+            .iter()
+            .map(|source| source.dp_rank())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
+    assert!(sources.iter().all(|source| matches!(
+        source,
+        dynamo_backend_common::KvEventSource::Zmq { topic, .. } if topic.is_empty()
+    )));
+    assert_eq!(
+        sources
+            .iter()
+            .map(|source| match source {
+                dynamo_backend_common::KvEventSource::Zmq { endpoint, .. } => endpoint.as_str(),
+                dynamo_backend_common::KvEventSource::Push { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        ["tcp://127.0.0.1:20081", "tcp://127.0.0.1:20082"]
+    );
+
+    let mut routed_request = serde_json::to_value(request()).expect("serialize request");
+    routed_request["routing"] = json!({"dp_rank": 1, "cache_salt": "cache-salt"});
+    let outputs = collect(
+        &engine,
+        serde_json::from_value(routed_request).expect("deserialize routed request"),
+    )
+    .await;
     assert_eq!(outputs.len(), 1);
     let terminal = &outputs[0];
     assert_eq!(terminal.token_ids, [42]);
@@ -722,6 +854,10 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let sent = requests.first().expect("recorded request");
     assert_eq!(sent.model, "served-model");
     assert_eq!(sent.priority, 0);
+    assert_eq!(
+        server.service.data_parallel_rank_metadata.lock().await[0],
+        Some("1".to_string())
+    );
     let sampling = sent.sampling.as_ref().unwrap();
     assert_eq!(
         (sampling.top_k, sampling.top_p, sampling.min_p),
@@ -748,7 +884,7 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     assert!(stopping.ignore_eos);
     let kv = sent.kv.as_ref().unwrap();
     assert!(kv.bypass_prefix_cache);
-    assert_eq!(kv.cache_salt, "cache-salt");
+    assert_eq!(kv.cache_salt, "dynamo-cache-salt:cache-salt");
     assert_eq!(
         struct_to_json(kv.kv_transfer_params.clone().unwrap()).unwrap(),
         json!({"connector_data": {"values": [1, true, null]}})
@@ -938,11 +1074,14 @@ async fn pool_uses_each_configured_connection() {
 
     for index in 0..4 {
         let mut stream = client
-            .generate_stream(pb::GenerateRequest {
-                request_id: format!("request-{index}"),
-                prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
-                ..Default::default()
-            })
+            .generate_stream(
+                pb::GenerateRequest {
+                    request_id: format!("request-{index}"),
+                    prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .expect("start stream");
         while stream.message().await.expect("message").is_some() {}
@@ -957,6 +1096,15 @@ async fn pool_uses_each_configured_connection() {
         .map(SocketAddr::port)
         .collect();
     assert_eq!(ports.len(), 2);
+    assert!(
+        server
+            .service
+            .data_parallel_rank_metadata
+            .lock()
+            .await
+            .iter()
+            .all(Option::is_none)
+    );
 }
 
 #[tokio::test]
@@ -1020,6 +1168,108 @@ async fn cancellation_interrupts_pending_response_headers() {
 }
 
 #[tokio::test]
+async fn decode_cancellation_waits_for_submission_and_first_token() {
+    let service = FakeVllm::default();
+    service.hang_before_headers.store(true, Ordering::SeqCst);
+    service
+        .hold_before_first_token
+        .store(true, Ordering::SeqCst);
+    let server = FakeServer::start(service).await;
+    let engine = engine(&server.endpoint, DisaggregationMode::Decode, 1);
+    engine.start(0).await.expect("start");
+
+    let context = dynamo_backend_common::testing::mock_context();
+    let generate = engine.generate(
+        decode_request(),
+        GenerateContext::new(context.clone(), None),
+    );
+    tokio::pin!(generate);
+
+    tokio::select! {
+        _ = &mut generate => panic!("decode returned before response headers were gated"),
+        _ = async {
+            while !server.service.headers_pending.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert_eq!(server.service.requests.lock().await.len(), 1);
+    context.stop_generating();
+    tokio::select! {
+        _ = &mut generate => panic!("decode cancellation returned before response headers"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    server.service.release_headers.notify_one();
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(2), &mut generate)
+        .await
+        .expect("decode response headers")
+        .expect("decode stream");
+    let next = stream.next();
+    tokio::pin!(next);
+    tokio::select! {
+        _ = &mut next => panic!("decode returned before the first token was gated"),
+        _ = async {
+            while !server.service.first_token_pending.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert!(
+        !server.service.server_stream_dropped.load(Ordering::SeqCst),
+        "decode stream dropped before the first token"
+    );
+    tokio::select! {
+        _ = &mut next => panic!("decode cancellation completed before the first token"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    server.service.release_first_token.notify_one();
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), &mut next)
+        .await
+        .expect("first token did not release decode cancellation")
+        .expect("cancelled terminal")
+        .expect("cancelled output");
+    assert_eq!(terminal.finish_reason, Some(FinishReason::Cancelled));
+    drop(stream);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !server.service.server_stream_dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server stream dropped after first token");
+}
+
+#[tokio::test]
+async fn decode_cancellation_maps_premature_eof_to_cancelled() {
+    let service = FakeVllm::default();
+    service
+        .close_before_first_token
+        .store(true, Ordering::SeqCst);
+    let server = FakeServer::start(service).await;
+    let engine = engine(&server.endpoint, DisaggregationMode::Decode, 1);
+    engine.start(0).await.expect("start");
+
+    let context = dynamo_backend_common::testing::mock_context();
+    let mut stream = engine
+        .generate(
+            decode_request(),
+            GenerateContext::new(context.clone(), None),
+        )
+        .await
+        .expect("decode stream");
+    context.stop_generating();
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("premature EOF did not release decode cancellation")
+        .expect("cancelled terminal")
+        .expect("cancelled output");
+    assert_eq!(terminal.finish_reason, Some(FinishReason::Cancelled));
+}
+
+#[tokio::test]
 async fn unsupported_features_fail_before_rpc_submission() {
     let server = FakeServer::start(FakeVllm::default()).await;
     let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
@@ -1039,11 +1289,14 @@ async fn unsupported_features_fail_before_rpc_submission() {
     multimodal.mm_processor_kwargs = Some(json!({"use_audio_in_video": true}));
     requests.push(multimodal);
 
-    for routing in [json!({"lora_name": "adapter"}), json!({"dp_rank": 1})] {
-        let mut value = serde_json::to_value(request()).expect("serialize request");
-        value["routing"] = routing;
-        requests.push(serde_json::from_value(value).expect("deserialize request"));
-    }
+    let mut lora_request = serde_json::to_value(request()).expect("serialize request");
+    lora_request["routing"] = json!({"lora_name": "adapter"});
+    requests.push(serde_json::from_value(lora_request).expect("deserialize request"));
+
+    let mut mismatched_cache_salt = request();
+    mismatched_cache_salt.extra_args.as_mut().unwrap()["nvext"]["cache_salt"] =
+        json!("different-cache-salt");
+    requests.push(mismatched_cache_salt);
 
     for unsupported in requests {
         let context = dynamo_backend_common::testing::mock_context();
