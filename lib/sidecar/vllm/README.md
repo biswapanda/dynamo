@@ -27,8 +27,13 @@ It is a standalone Rust executable.
 - Opaque `kv_transfer_params` handoff
 - Data-parallel rank routing and KV-event source discovery
 - Capability-gated RL pause/resume, sleep/wake, weight-transfer, and weight-version controls through native gRPC
+- Image URL and data-URI inputs, including media UUIDs
 
-The protocol does not support multimodal input, LoRA, encode workers, beam search, or `n > 1`.
+The protocol does not support LoRA, encode workers, beam search, `n > 1`,
+preprocessed multimodal features, audio/video media, or Dynamo tool-call and
+reasoning parsers. Parser defaults returned by Control are intentionally not
+advertised to the Dynamo frontend because the current inference protocol does
+not preserve all parser-related request semantics.
 
 ## Run
 
