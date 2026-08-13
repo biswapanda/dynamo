@@ -359,6 +359,22 @@ impl LLMEngine for VllmSidecarEngine {
         Ok(controls)
     }
 
+    fn validate_engine_control(&self, control: &str, body: &Value) -> Result<(), DynamoError> {
+        let body = request_object(body)?;
+        match control {
+            "pause_generation" => {
+                pause_mode(body, "pause_generation")?;
+                optional_bool(body, "clear_cache")?;
+            }
+            "sleep" => {
+                optional_u32(body, "level")?;
+                pause_mode(body, "sleep")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn engine_control(&self, control: String, body: Value) -> Result<Value, DynamoError> {
         if !self.supported_controls().await?.contains(&control) {
             return Ok(unsupported("control", &control));
@@ -433,18 +449,17 @@ impl LLMEngine for VllmSidecarEngine {
         let Some(capabilities) = self.model.rl_capabilities() else {
             return Ok(Vec::new());
         };
-        if !capabilities.weight_transfer_enabled {
-            return Ok(Vec::new());
-        }
-        let mut updates = vec![
-            "init_weight_transfer_engine".to_string(),
-            "start_weight_update".to_string(),
-            "update_weights".to_string(),
-            "finish_weight_update".to_string(),
-            "update_weight_version".to_string(),
-        ];
-        if capabilities.draft_weight_updates_enabled {
-            updates.push("start_draft_weight_update".to_string());
+        let mut updates = vec!["update_weight_version".to_string()];
+        if capabilities.weight_transfer_enabled {
+            updates.extend([
+                "init_weight_transfer_engine".to_string(),
+                "start_weight_update".to_string(),
+                "update_weights".to_string(),
+                "finish_weight_update".to_string(),
+            ]);
+            if capabilities.draft_weight_updates_enabled {
+                updates.push("start_draft_weight_update".to_string());
+            }
         }
         Ok(updates)
     }

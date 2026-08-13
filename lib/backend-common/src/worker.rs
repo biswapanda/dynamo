@@ -339,6 +339,17 @@ impl EngineKind {
         }
     }
 
+    fn validate_engine_control(
+        &self,
+        control: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), DynamoError> {
+        match self {
+            EngineKind::Llm(e) => e.validate_engine_control(control, body),
+            EngineKind::Raw(_) => Ok(()),
+        }
+    }
+
     async fn supported_updates(&self) -> Result<Vec<String>, DynamoError> {
         match self {
             EngineKind::Llm(e) => e.supported_updates().await,
@@ -727,6 +738,7 @@ impl Worker {
             let callback = wrap_engine_control_callback(
                 control_name.clone(),
                 callback,
+                self.engine.clone(),
                 endpoint.clone(),
                 control_lock.clone(),
             );
@@ -1452,12 +1464,14 @@ fn engine_update_callback(update_name: String, engine: EngineKind) -> EngineRout
 fn wrap_engine_control_callback(
     control_name: String,
     callback: EngineRouteCallback,
+    engine: EngineKind,
     endpoint: dynamo_runtime::component::Endpoint,
     control_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> EngineRouteCallback {
     let policy = engine_control_policy(&control_name);
     Arc::new(move |body| {
         let callback = callback.clone();
+        let engine = engine.clone();
         let endpoint = endpoint.clone();
         let control_name = control_name.clone();
         let control_lock = control_lock.clone();
@@ -1467,6 +1481,9 @@ fn wrap_engine_control_callback(
                 EngineControlPolicy::UnregisterBefore => {
                     if let Some(response) = control_request_body_error(&body) {
                         return Ok(response);
+                    }
+                    if let Err(error) = engine.validate_engine_control(&control_name, &body) {
+                        return Ok(control_error_response(error.to_string()));
                     }
 
                     // Hold across unregister + callback so a concurrent resume
@@ -3072,9 +3089,9 @@ mod tests {
     }
 }
 
-// Integration tests for the `on_endpoint_ready` handoff. These need a real
-// `DistributedRuntime`/`Endpoint` (NATS-backed), so they live behind the
-// `integration` feature:
+// Integration tests for endpoint handoff and discovery lifecycle policy. These
+// need a real `DistributedRuntime`/`Endpoint` (NATS-backed), so they live behind
+// the `integration` feature:
 //   cargo test -p dynamo-backend-common --features integration on_endpoint_ready
 #[cfg(all(test, feature = "integration"))]
 mod handoff_integration_tests {
@@ -3097,10 +3114,24 @@ mod handoff_integration_tests {
             .endpoint("generate")
     }
 
-    /// Mock engine that records the order of `on_endpoint_ready`,
-    /// `supported_controls`, and `supported_updates` calls, lets a test force
-    /// `on_endpoint_ready` to fail, and advertises configurable control/update
-    /// sets.
+    /// Build an endpoint with in-memory discovery and the local TCP request
+    /// plane so lifecycle tests do not require an external NATS server.
+    async fn test_local_endpoint() -> dynamo_runtime::component::Endpoint {
+        let runtime = dynamo_runtime::Runtime::from_current().unwrap();
+        let config = dynamo_runtime::distributed::DistributedConfig::process_local();
+        let drt = dynamo_runtime::DistributedRuntime::new(runtime, config)
+            .await
+            .unwrap();
+        drt.namespace("lifecycle_ns")
+            .unwrap()
+            .component("lifecycle_comp")
+            .unwrap()
+            .endpoint("generate")
+    }
+
+    /// Mock engine that records endpoint/control lifecycle calls, lets a test
+    /// force `on_endpoint_ready` to fail, and advertises configurable
+    /// control/update sets.
     struct HandoffMockEngine {
         log: Arc<StdMutex<Vec<&'static str>>>,
         endpoint_ready_should_fail: bool,
@@ -3152,6 +3183,33 @@ mod handoff_integration_tests {
         async fn supported_controls(&self) -> Result<Vec<String>, DynamoError> {
             self.log.lock().unwrap().push("supported_controls");
             Ok(self.controls.clone())
+        }
+
+        fn validate_engine_control(
+            &self,
+            control: &str,
+            body: &serde_json::Value,
+        ) -> Result<(), DynamoError> {
+            self.log.lock().unwrap().push("validate_engine_control");
+            if control == "pause_generation"
+                && body.get("mode").and_then(serde_json::Value::as_str) == Some("malformed")
+            {
+                return Err(err(
+                    ErrorType::Backend(BackendError::InvalidArgument),
+                    "pause_generation mode must be abort, wait, or keep",
+                ));
+            }
+            Ok(())
+        }
+
+        async fn engine_control(
+            &self,
+            control: String,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, DynamoError> {
+            self.log.lock().unwrap().push("engine_control");
+            self.validate_engine_control(&control, &body)?;
+            Ok(serde_json::json!({"status": "paused"}))
         }
 
         async fn supported_updates(&self) -> Result<Vec<String>, DynamoError> {
@@ -3278,6 +3336,50 @@ mod handoff_integration_tests {
             routes.get("load_lora").is_none(),
             "update must not be registered under its bare name"
         );
+    }
+
+    /// Regression: malformed pause fields could unregister a serving worker
+    /// before validation, removing healthy capacity; this test catches it at
+    /// the engine-route/discovery boundary.
+    #[tokio::test]
+    async fn malformed_pause_does_not_execute_or_unregister_worker() {
+        let endpoint = test_local_endpoint().await;
+        endpoint.register_endpoint_instance().await.unwrap();
+        let (engine, log) =
+            HandoffMockEngine::new(false, vec!["pause_generation".to_string()], Vec::new());
+        let worker = Worker::new(engine, WorkerConfig::default());
+        worker
+            .register_engine_controls(&endpoint)
+            .await
+            .expect("control registration should succeed");
+
+        let callback = endpoint
+            .drt()
+            .engine_routes()
+            .get("control/pause_generation")
+            .unwrap();
+        let response = callback(serde_json::json!({"mode": "malformed"}))
+            .await
+            .unwrap();
+
+        assert!(control_response_is_error(&response));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["supported_controls", "validate_engine_control"],
+            "malformed input must be rejected before engine execution"
+        );
+        let endpoint_id = endpoint.id();
+        let instances = endpoint
+            .drt()
+            .discovery()
+            .list(DiscoveryQuery::Endpoint {
+                namespace: endpoint_id.namespace,
+                component: endpoint_id.component,
+                endpoint: endpoint_id.name,
+            })
+            .await
+            .unwrap();
+        assert_eq!(instances.len(), 1, "worker must remain in discovery");
     }
 
     #[tokio::test]

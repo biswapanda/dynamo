@@ -73,7 +73,7 @@ dynamo-vllm-sidecar \
   --enable-rl
 ```
 
-`--enable-rl` (or `DYN_ENABLE_RL=true`) registers `dyn://<namespace>.<component>.rl`, which lets the Dynamo frontend discover this worker and its `/engine/control/*` and `/engine/update/*` routes through `/v1/rl/workers`. The sidecar advertises pause/resume and weight-version queries when the vLLM server reports the RL gRPC API, sleep routes only with `--enable-sleep-mode`, weight-update routes only with `--weight-transfer-config`, and draft updates only when speculative decoding supports them.
+`--enable-rl` (or `DYN_ENABLE_RL=true`) registers `dyn://<namespace>.<component>.rl`, which lets the Dynamo frontend discover this worker and its `/engine/control/*` and `/engine/update/*` routes through `/v1/rl/workers`. The sidecar advertises pause/resume and weight-version controls when the vLLM server reports the RL gRPC API, sleep routes only with `--enable-sleep-mode`, weight-transfer routes only with `--weight-transfer-config`, and draft updates only when speculative decoding supports them.
 
 The update request bodies match vLLM's RL HTTP schemas: `init_weight_transfer_engine` requires `{"init_info": {...}}`, `update_weights` requires `{"update_info": {...}}`, `finish_weight_update` accepts `{"weight_version": "..."}`, and `update_weight_version` requires `{"new_version": "..."}`. Weight tensors remain on the configured NCCL, IPC, or sparse-NCCL transport; only backend metadata crosses gRPC.
 

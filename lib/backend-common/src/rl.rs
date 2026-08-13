@@ -47,14 +47,13 @@ pub(crate) async fn serve_endpoint(primary: &Endpoint) -> anyhow::Result<RlServe
 
 fn self_host_base_url(drt: &dynamo_runtime::DistributedRuntime) -> Option<String> {
     let info = drt.system_status_server_info()?;
-    let configured = dynamo_runtime::RuntimeConfig::from_settings()
-        .unwrap_or_default()
-        .system_host;
-    let host = match configured.as_str() {
-        "0.0.0.0" | "::" | "[::]" => dynamo_runtime::utils::local_ip_for_advertise(),
-        _ => configured,
-    };
-    Some(format!("http://{host}:{}", info.port()))
+    let socket_addr = info.socket_addr;
+    if socket_addr.ip().is_unspecified() {
+        let host = dynamo_runtime::utils::local_ip_for_advertise();
+        Some(format!("http://{host}:{}", socket_addr.port()))
+    } else {
+        Some(format!("http://{socket_addr}"))
+    }
 }
 
 fn resolve_endpoint_name(primary_name: &str) -> anyhow::Result<String> {
