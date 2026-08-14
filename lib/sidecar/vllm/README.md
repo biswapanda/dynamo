@@ -68,12 +68,12 @@ vllm-rs serve Qwen/Qwen3-0.6B \
   --enable-sleep-mode \
   --weight-transfer-config '{"backend":"nccl"}'
 
-dynamo-vllm-sidecar \
+DYN_SYSTEM_PORT=8081 dynamo-vllm-sidecar \
   --vllm-endpoint 127.0.0.1:50051 \
   --enable-rl
 ```
 
-`--enable-rl` (or `DYN_ENABLE_RL=true`) registers `dyn://<namespace>.<component>.rl`, which lets the Dynamo frontend discover this worker and its `/engine/control/*` and `/engine/update/*` routes through `/v1/rl/workers`. The sidecar advertises pause/resume and weight-version controls when the vLLM server reports the RL gRPC API, sleep routes only with `--enable-sleep-mode`, weight-transfer routes only with `--weight-transfer-config`, and draft updates only when speculative decoding supports them.
+`--enable-rl` (or `DYN_ENABLE_RL=true`) requires the Dynamo system server (`DYN_SYSTEM_PORT=0` or a positive port) and registers `dyn://<namespace>.<component>.rl`, which lets the Dynamo frontend discover this worker and its `/engine/control/*` and `/engine/update/*` routes through `/v1/rl/workers`. The sidecar advertises pause/resume, sleep-status, and weight-version controls when the vLLM server reports the RL gRPC API; mutating sleep/wake routes require `--enable-sleep-mode`, weight-transfer routes require `--weight-transfer-config`, and draft updates require speculative decoding support.
 
 The update request bodies match vLLM's RL HTTP schemas: `init_weight_transfer_engine` requires `{"init_info": {...}}`, `update_weights` requires `{"update_info": {...}}`, `finish_weight_update` accepts `{"weight_version": "..."}`, and `update_weight_version` requires `{"new_version": "..."}`. Weight tensors remain on the configured NCCL, IPC, or sparse-NCCL transport; only backend metadata crosses gRPC.
 

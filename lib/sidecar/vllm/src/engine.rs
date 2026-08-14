@@ -347,14 +347,11 @@ impl LLMEngine for VllmSidecarEngine {
             "pause_generation".to_string(),
             "resume_generation".to_string(),
             "is_paused".to_string(),
+            "is_sleeping".to_string(),
             "get_weight_version".to_string(),
         ];
         if capabilities.sleep_mode_enabled {
-            controls.extend([
-                "sleep".to_string(),
-                "wake_up".to_string(),
-                "is_sleeping".to_string(),
-            ]);
+            controls.extend(["sleep".to_string(), "wake_up".to_string()]);
         }
         Ok(controls)
     }
@@ -367,8 +364,11 @@ impl LLMEngine for VllmSidecarEngine {
                 optional_bool(body, "clear_cache")?;
             }
             "sleep" => {
-                optional_u32(body, "level")?;
+                sleep_level(body)?;
                 pause_mode(body, "sleep")?;
+            }
+            "wake_up" => {
+                wake_tags(body)?;
             }
             _ => {}
         }
@@ -397,7 +397,20 @@ impl LLMEngine for VllmSidecarEngine {
                 grpc.resume_generation(crate::proto::ResumeGenerationRequest {})
                     .await
                     .map_err(|status| client::status_to_dynamo("ResumeGeneration", status))?;
-                Ok(json!({"status": "resumed"}))
+                let sleeping = if self
+                    .model
+                    .rl_capabilities()
+                    .is_some_and(|capabilities| capabilities.sleep_mode_enabled)
+                {
+                    grpc_is_sleeping(&mut grpc).await?
+                } else {
+                    false
+                };
+                if sleeping {
+                    Ok(json!({"status": "resumed", "is_sleeping": true}))
+                } else {
+                    Ok(json!({"status": "resumed"}))
+                }
             }
             "is_paused" => {
                 let response = grpc
@@ -408,7 +421,7 @@ impl LLMEngine for VllmSidecarEngine {
                 Ok(json!({"is_paused": response.paused}))
             }
             "sleep" => {
-                let level = optional_u32(body, "level")?;
+                let level = sleep_level(body)?;
                 let mode = pause_mode(body, "sleep")?;
                 grpc.sleep(crate::proto::SleepRequest {
                     level,
@@ -419,20 +432,17 @@ impl LLMEngine for VllmSidecarEngine {
                 Ok(json!({"status": "sleeping"}))
             }
             "wake_up" => {
-                let tags = optional_strings(body, "tags")?.unwrap_or_default();
+                let tags = wake_tags(body)?;
                 grpc.wake_up(crate::proto::WakeUpRequest { tags })
                     .await
                     .map_err(|status| client::status_to_dynamo("WakeUp", status))?;
-                Ok(json!({"status": "awake"}))
+                if grpc_is_sleeping(&mut grpc).await? {
+                    Ok(json!({"status": "partially_awake", "is_sleeping": true}))
+                } else {
+                    Ok(json!({"status": "awake"}))
+                }
             }
-            "is_sleeping" => {
-                let response = grpc
-                    .is_sleeping(crate::proto::IsSleepingRequest {})
-                    .await
-                    .map_err(|status| client::status_to_dynamo("IsSleeping", status))?
-                    .into_inner();
-                Ok(json!({"is_sleeping": response.sleeping}))
-            }
+            "is_sleeping" => Ok(json!({"is_sleeping": grpc_is_sleeping(&mut grpc).await?})),
             "get_weight_version" => {
                 let response = grpc
                     .get_weight_version(crate::proto::GetWeightVersionRequest {})
@@ -602,6 +612,15 @@ fn unsupported(kind: &str, name: &str) -> Value {
     })
 }
 
+async fn grpc_is_sleeping(
+    grpc: &mut crate::proto::control_client::ControlClient<tonic::transport::Channel>,
+) -> Result<bool, DynamoError> {
+    grpc.is_sleeping(crate::proto::IsSleepingRequest {})
+        .await
+        .map_err(|status| client::status_to_dynamo("IsSleeping", status))
+        .map(|response| response.into_inner().sleeping)
+}
+
 fn request_object(body: &Value) -> Result<&Map<String, Value>, DynamoError> {
     body.as_object()
         .ok_or_else(|| client::invalid_argument("engine request body must be a JSON object"))
@@ -626,6 +645,16 @@ fn optional_u32(body: &Map<String, Value>, field: &str) -> Result<Option<u32>, D
             .map(Some)
             .ok_or_else(|| client::invalid_argument(format!("`{field}` must be a uint32"))),
     }
+}
+
+fn sleep_level(body: &Map<String, Value>) -> Result<Option<u32>, DynamoError> {
+    let level = optional_u32(body, "level")?;
+    if level.is_some_and(|level| level > 2) {
+        return Err(client::invalid_argument(
+            "`level` must be one of 0, 1, or 2",
+        ));
+    }
+    Ok(level)
 }
 
 fn optional_string(body: &Map<String, Value>, field: &str) -> Result<Option<String>, DynamoError> {
@@ -677,6 +706,19 @@ fn optional_strings(
             "`{field}` must be an array of strings"
         ))),
     }
+}
+
+fn wake_tags(body: &Map<String, Value>) -> Result<Vec<String>, DynamoError> {
+    let tags = optional_strings(body, "tags")?.unwrap_or_default();
+    if let Some(tag) = tags
+        .iter()
+        .find(|tag| !matches!(tag.as_str(), "weights" | "kv_cache" | "scheduling"))
+    {
+        return Err(client::invalid_argument(format!(
+            "wake_up tag must be weights, kv_cache, or scheduling; got `{tag}`"
+        )));
+    }
+    Ok(tags)
 }
 
 fn required_object_json(body: &Map<String, Value>, field: &str) -> Result<Vec<u8>, DynamoError> {

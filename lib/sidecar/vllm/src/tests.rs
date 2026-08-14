@@ -47,7 +47,7 @@ struct FakeVllm {
     server_stream_dropped: Arc<AtomicBool>,
     control_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     paused: Arc<AtomicBool>,
-    sleeping: Arc<AtomicBool>,
+    sleeping_tags: Arc<Mutex<BTreeSet<String>>>,
     weight_version: Arc<Mutex<String>>,
 }
 
@@ -312,7 +312,12 @@ impl pb::control_server::Control for FakeVllm {
             json!({"level": request.level, "mode": request.mode}),
         )
         .await;
-        self.sleeping.store(true, Ordering::SeqCst);
+        let mut sleeping_tags = self.sleeping_tags.lock().await;
+        *sleeping_tags = if request.level == Some(0) {
+            BTreeSet::from(["scheduling".to_string()])
+        } else {
+            BTreeSet::from(["kv_cache".to_string(), "weights".to_string()])
+        };
         Ok(Response::new(pb::SleepResponse {}))
     }
 
@@ -320,9 +325,17 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         request: Request<pb::WakeUpRequest>,
     ) -> Result<Response<pb::WakeUpResponse>, Status> {
-        self.record_control("wake_up", json!({"tags": request.into_inner().tags}))
+        let tags = request.into_inner().tags;
+        self.record_control("wake_up", json!({"tags": tags.clone()}))
             .await;
-        self.sleeping.store(false, Ordering::SeqCst);
+        let mut sleeping_tags = self.sleeping_tags.lock().await;
+        if tags.is_empty() {
+            sleeping_tags.clear();
+        } else {
+            for tag in tags {
+                sleeping_tags.remove(&tag);
+            }
+        }
         Ok(Response::new(pb::WakeUpResponse {}))
     }
 
@@ -331,7 +344,7 @@ impl pb::control_server::Control for FakeVllm {
         _request: Request<pb::IsSleepingRequest>,
     ) -> Result<Response<pb::IsSleepingResponse>, Status> {
         Ok(Response::new(pb::IsSleepingResponse {
-            sleeping: self.sleeping.load(Ordering::SeqCst),
+            sleeping: !self.sleeping_tags.lock().await.is_empty(),
         }))
     }
 
@@ -719,13 +732,23 @@ fn engine(
     connections: usize,
     model: pb::ModelInfo,
 ) -> VllmSidecarEngine {
+    engine_with_server_info(endpoint, mode, connections, model, server_info())
+}
+
+fn engine_with_server_info(
+    endpoint: &str,
+    mode: DisaggregationMode,
+    connections: usize,
+    model: pb::ModelInfo,
+    server: pb::ServerInfo,
+) -> VllmSidecarEngine {
     let transport = GrpcTransportConfig {
         connections: NonZeroUsize::new(connections).expect("non-zero connection count"),
         ..Default::default()
     };
     VllmSidecarEngine::new(
         GrpcEndpoint::parse(endpoint, "--vllm-endpoint").expect("valid test endpoint"),
-        DiscoveredModel::from_proto(model, server_info()).expect("valid discovery"),
+        DiscoveredModel::from_proto(model, server).expect("valid discovery"),
         mode,
         transport,
     )
@@ -959,6 +982,23 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
         .collect()
     );
 
+    // Regression: unsupported sleep levels or wake tags can enter vLLM's
+    // destructive/partial sleep paths while still returning gRPC success.
+    for (control, body, expected) in [
+        ("sleep", json!({"level": 3}), "one of 0, 1, or 2"),
+        (
+            "wake_up",
+            json!({"tags": ["unknown"]}),
+            "weights, kv_cache, or scheduling",
+        ),
+    ] {
+        let error = engine
+            .engine_control(control.to_string(), body)
+            .await
+            .expect_err("unsupported lifecycle value must fail before gRPC");
+        assert!(error.to_string().contains(expected), "unexpected {error}");
+    }
+
     for (control, body, expected) in [
         ("is_paused", json!({}), json!({"is_paused": false})),
         (
@@ -979,9 +1019,9 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
         (
             "wake_up",
             json!({"tags": ["weights"]}),
-            json!({"status": "awake"}),
+            json!({"status": "partially_awake", "is_sleeping": true}),
         ),
-        ("is_sleeping", json!({}), json!({"is_sleeping": false})),
+        ("is_sleeping", json!({}), json!({"is_sleeping": true})),
     ] {
         assert_eq!(
             engine
@@ -1088,6 +1128,36 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
     ]);
     assert_eq!(calls.len(), expected.len(), "each mutating RPC runs once");
     assert_eq!(actual, expected);
+}
+
+/// Regression: vLLM exposes sleep status independently of CUDA sleep-mode
+/// allocation support, so capability discovery must not hide the status RPC
+/// when only the mutating sleep/wake operations are disabled.
+#[tokio::test]
+async fn sleep_status_remains_advertised_without_sleep_mode() {
+    let mut server = server_info();
+    server
+        .rl_capabilities
+        .as_mut()
+        .expect("RL capabilities")
+        .sleep_mode_enabled = false;
+    let engine = engine_with_server_info(
+        "http://127.0.0.1:1",
+        DisaggregationMode::Aggregated,
+        1,
+        model_info(),
+        server,
+    );
+
+    let controls = engine
+        .supported_controls()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(controls.contains("is_sleeping"));
+    assert!(!controls.contains("sleep"));
+    assert!(!controls.contains("wake_up"));
 }
 
 #[tokio::test]

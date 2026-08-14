@@ -21,19 +21,38 @@ pub(crate) struct RlServeEndpoint {
     started: StartedEndpoint,
 }
 
+pub(crate) struct RlEndpointConfig {
+    endpoint_name: String,
+    system_url: String,
+}
+
 impl RlServeEndpoint {
     pub(crate) async fn shutdown(self) -> anyhow::Result<()> {
         self.started.shutdown().await
     }
 }
 
-pub(crate) async fn serve_endpoint(primary: &Endpoint) -> anyhow::Result<RlServeEndpoint> {
+pub(crate) fn prepare_endpoint(primary: &Endpoint) -> anyhow::Result<RlEndpointConfig> {
     let endpoint_name = resolve_endpoint_name(&primary.id().name)?;
-    let endpoint = primary.component().endpoint(endpoint_name);
-    let system_url = self_host_base_url(primary.drt());
+    let system_url = self_host_base_url(primary.drt()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "RL discovery requires the Dynamo system server; set DYN_SYSTEM_PORT to 0 or a positive port"
+        )
+    })?;
+    Ok(RlEndpointConfig {
+        endpoint_name,
+        system_url,
+    })
+}
+
+pub(crate) async fn serve_endpoint(
+    primary: &Endpoint,
+    config: RlEndpointConfig,
+) -> anyhow::Result<RlServeEndpoint> {
+    let endpoint = primary.component().endpoint(config.endpoint_name);
     let handler = Arc::new(RlRouteHandler {
         routes: primary.drt().engine_routes().clone(),
-        system_url,
+        system_url: config.system_url,
     });
     let ingress = Ingress::for_engine(handler)?;
     let started = endpoint
@@ -80,7 +99,7 @@ fn validate_endpoint_name(endpoint_name: &str, primary_name: &str) -> anyhow::Re
 
 struct RlRouteHandler {
     routes: EngineRouteRegistry,
-    system_url: Option<String>,
+    system_url: String,
 }
 
 impl RlRouteHandler {
@@ -136,7 +155,7 @@ mod tests {
         );
         let handler = RlRouteHandler {
             routes,
-            system_url: Some("http://worker:8080".to_string()),
+            system_url: "http://worker:8080".to_string(),
         };
 
         assert_eq!(
