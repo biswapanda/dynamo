@@ -459,6 +459,43 @@ fn server_info() -> pb::ServerInfo {
     }
 }
 
+#[test]
+fn discovered_model_reports_rl_worker_metadata() {
+    let model = DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery");
+    assert_eq!(
+        model.rl_worker_metadata().expect("valid RL metadata"),
+        dynamo_backend_common::RlWorkerMetadata::new(4, Some("nccl".to_string()))
+            .expect("valid expected metadata")
+    );
+}
+
+#[test]
+fn discovered_model_advertises_token_native_generate() {
+    let model = DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery");
+    assert_eq!(
+        model
+            .engine_config()
+            .runtime_data
+            .get("vllm_inference_v1_generate"),
+        Some(&serde_json::Value::Bool(true))
+    );
+}
+
+#[test]
+fn startup_compatibility_rejects_parallelism_change() {
+    let expected =
+        DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery");
+    let mut changed_server = server_info();
+    changed_server
+        .parallelism
+        .as_mut()
+        .expect("parallelism")
+        .tensor_parallel_size = 4;
+    let changed =
+        DiscoveredModel::from_proto(model_info(), changed_server).expect("valid changed discovery");
+    assert!(expected.ensure_startup_compatible(&changed).is_err());
+}
+
 fn sequence_response(
     terminal: bool,
     logprobs: bool,
@@ -608,6 +645,176 @@ fn oversized_logprob_counts_are_rejected() {
     )
     .expect_err("oversized prompt logprobs must fail");
     assert!(prompt_error.to_string().contains("must fit in i32"));
+}
+
+#[test]
+fn token_native_compatibility_envelope_is_accepted_when_fields_are_projected() {
+    let mut request = request();
+    request.output_options.skip_special_tokens = Some(false);
+    request.routing.as_mut().unwrap().priority = Some(-7);
+    request.extra_args = Some(json!({
+        "vllm_tito": {
+            "request_id": "request-1",
+            "sampling_params": {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "top_k": 4,
+                "min_p": 0.1,
+                "seed": 123,
+                "max_tokens": 1,
+                "min_tokens": 1,
+                "presence_penalty": 0.3,
+                "frequency_penalty": 0.4,
+                "repetition_penalty": 1.1,
+                "stop_token_ids": [2],
+                "ignore_eos": true,
+                "logprobs": 1,
+                "prompt_logprobs": 1,
+                "cache_salt": "cache-salt",
+                "skip_reading_prefix_cache": true,
+                "skip_special_tokens": false,
+                "return_token_ids": true
+            },
+            "model": "served-model",
+            "stream": false,
+            "cache_salt": "cache-salt",
+            "priority": 7,
+            "kv_transfer_params": {
+                "connector_data": {"values": [1, true, null]}
+            }
+        }
+    }));
+
+    let wire = build_generate_request(
+        request,
+        "request-1".to_string(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect("projected compatibility envelope");
+
+    assert_eq!(wire.temperature, Some(0.2));
+    assert_eq!(wire.stopping.as_ref().unwrap().stop_token_ids, [2]);
+    assert_eq!(
+        wire.stopping.as_ref().unwrap().skip_special_tokens,
+        Some(false)
+    );
+    assert!(wire.response.as_ref().unwrap().output_logprobs);
+    assert_eq!(
+        wire.kv.as_ref().unwrap().cache_salt,
+        "dynamo-cache-salt:cache-salt"
+    );
+    assert!(wire.kv.as_ref().unwrap().bypass_prefix_cache);
+    assert!(wire.kv.as_ref().unwrap().kv_transfer_params.is_some());
+    assert_eq!(wire.priority, 7);
+}
+
+#[test]
+fn token_native_compatibility_envelope_rejects_disabled_token_ids() {
+    let mut request = request();
+    request.extra_args = Some(json!({
+        "vllm_tito": {
+            "request_id": "request-1",
+            "sampling_params": {
+                "max_tokens": 1,
+                "return_token_ids": false
+            },
+            "stream": false,
+            "priority": 0
+        }
+    }));
+
+    let error = build_generate_request(
+        request,
+        "request-1".to_string(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect_err("the token-native sidecar always returns token IDs");
+
+    assert!(
+        error
+            .to_string()
+            .contains("sampling_params.return_token_ids must be true")
+    );
+}
+
+#[test]
+fn token_native_compatibility_envelope_rejects_conflicting_cache_salt() {
+    let mut request = request();
+    request.extra_args = Some(json!({
+        "vllm_tito": {
+            "request_id": "request-1",
+            "sampling_params": {
+                "max_tokens": 1,
+                "cache_salt": "different-policy-version"
+            },
+            "cache_salt": "cache-salt",
+            "stream": false,
+            "priority": 0
+        }
+    }));
+
+    let error = build_generate_request(
+        request,
+        "request-1".to_string(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect_err("duplicate cache salts must match the canonical routing salt");
+
+    assert!(
+        error
+            .to_string()
+            .contains("sampling_params.cache_salt must match the canonical cache_salt")
+    );
+}
+
+#[test]
+fn token_native_compatibility_envelope_rejects_unprojected_fields() {
+    let mut request = request();
+    request.extra_args = Some(json!({
+        "vllm_tito": {
+            "request_id": "request-1",
+            "sampling_params": {
+                "max_tokens": 1,
+                "future_sampling_field": true
+            },
+            "stream": false,
+            "priority": 0
+        }
+    }));
+
+    let error = build_generate_request(
+        request,
+        "request-1".to_string(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect_err("unprojected compatibility fields must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("extra_args.vllm_tito.sampling_params.future_sampling_field")
+    );
+}
+
+#[test]
+fn skip_special_tokens_false_is_forwarded_to_vllm() {
+    let mut request = request();
+    request.output_options.skip_special_tokens = Some(false);
+
+    let mapped = build_generate_request(
+        request,
+        "skip-special-tokens".to_string(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect("skip_special_tokens=false should be supported");
+
+    assert_eq!(
+        mapped
+            .stopping
+            .expect("stopping criteria")
+            .skip_special_tokens,
+        Some(false)
+    );
 }
 
 struct FakeServer {

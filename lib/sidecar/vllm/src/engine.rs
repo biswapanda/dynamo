@@ -109,6 +109,12 @@ impl VllmSidecarEngine {
         );
         let model = bootstrap_discover(&endpoint, transport, bootstrap_deadline)?;
         let mode = args.sidecar.common.disaggregation_mode;
+        let rl_metadata = args
+            .sidecar
+            .common
+            .enable_rl
+            .then(|| model.rl_worker_metadata())
+            .transpose()?;
         let engine = Self::new(endpoint, model.clone(), mode, transport);
         let config = WorkerConfig {
             namespace: args.sidecar.common.namespace,
@@ -135,6 +141,7 @@ impl VllmSidecarEngine {
             disaggregation_mode: mode,
             route_to_encoder: false,
             enable_rl: args.sidecar.common.enable_rl,
+            rl_metadata,
             ..Default::default()
         };
         Ok((engine, config))
