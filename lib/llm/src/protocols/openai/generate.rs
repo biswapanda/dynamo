@@ -78,6 +78,12 @@ impl GenerateRequest {
         }
     }
 
+    pub(crate) fn resolved_cache_salt(&self) -> Option<&str> {
+        self.cache_salt
+            .as_deref()
+            .or_else(|| self.sampling_params.cache_salt())
+    }
+
     /// Validate the request-level rules enforced by vLLM's Rust generate route.
     pub fn validate(&self) -> Result<(), String> {
         if self.token_ids.is_empty() {
@@ -90,6 +96,10 @@ impl GenerateRequest {
 
         if self.sampling_params.max_tokens() == Some(0) {
             return Err("sampling_params.max_tokens must be greater than 0.".to_string());
+        }
+
+        if self.sampling_params.top_k().is_some_and(|top_k| top_k < -1) {
+            return Err("sampling_params.top_k must be -1, 0, or positive.".to_string());
         }
 
         if let Some(prompt_logprobs) = self.sampling_params.prompt_logprobs() {
@@ -114,6 +124,16 @@ impl GenerateRequest {
             return Err(format!(
                 "sampling_params.min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})."
             ));
+        }
+
+        if let (Some(top_level), Some(nested)) = (
+            self.cache_salt.as_deref(),
+            self.sampling_params.cache_salt(),
+        ) && top_level != nested
+        {
+            return Err(
+                "sampling_params.cache_salt conflicts with the top-level cache_salt.".to_string(),
+            );
         }
 
         Ok(())
@@ -151,7 +171,7 @@ pub struct SamplingParams {
     // reads only the controls it needs; `raw` remains authoritative.
     temperature: Option<f32>,
     top_p: Option<f32>,
-    top_k: Option<u32>,
+    top_k: Option<i32>,
     seed: Option<i64>,
     max_tokens: Option<u32>,
     min_tokens: Option<u32>,
@@ -162,8 +182,11 @@ pub struct SamplingParams {
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
+    stop: Option<Vec<String>>,
     stop_token_ids: Option<Vec<u32>>,
     ignore_eos: bool,
+    include_stop_str_in_output: Option<bool>,
+    skip_special_tokens: Option<bool>,
     logit_bias: Option<HashMap<u32, f32>>,
     allowed_token_ids: Option<Vec<u32>>,
     bad_words: Option<Vec<String>>,
@@ -172,6 +195,7 @@ pub struct SamplingParams {
     /// typed view opaque avoids duplicating version-specific vLLM validation.
     structured_outputs: Option<Value>,
     skip_reading_prefix_cache: Option<bool>,
+    cache_salt: Option<String>,
     vllm_xargs: Option<HashMap<String, Value>>,
 }
 
@@ -184,6 +208,46 @@ impl SamplingParams {
         self.min_tokens
     }
 
+    pub fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
+    pub fn top_p(&self) -> Option<f32> {
+        self.top_p
+    }
+
+    pub fn top_k(&self) -> Option<i32> {
+        self.top_k
+    }
+
+    pub fn min_p(&self) -> Option<f32> {
+        self.min_p
+    }
+
+    pub fn seed(&self) -> Option<i64> {
+        self.seed
+    }
+
+    pub fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+
+    pub fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
+    }
+
+    pub fn repetition_penalty(&self) -> Option<f32> {
+        self.repetition_penalty
+    }
+
+    pub fn stop(&self) -> Option<Vec<String>> {
+        self.stop.clone()
+    }
+
+    pub fn stop_token_ids(&self) -> Option<Vec<u32>> {
+        self.stop_token_ids.clone()
+    }
+
     pub fn ignore_eos(&self) -> bool {
         self.ignore_eos
     }
@@ -194,6 +258,18 @@ impl SamplingParams {
 
     pub fn prompt_logprobs(&self) -> Option<i32> {
         self.prompt_logprobs
+    }
+
+    pub fn include_stop_str_in_output(&self) -> Option<bool> {
+        self.include_stop_str_in_output
+    }
+
+    pub fn skip_special_tokens(&self) -> Option<bool> {
+        self.skip_special_tokens
+    }
+
+    pub fn cache_salt(&self) -> Option<&str> {
+        self.cache_salt.as_deref()
     }
 
     pub fn as_value(&self) -> &Value {
@@ -245,15 +321,19 @@ impl<'de> Deserialize<'de> for SamplingParams {
             frequency_penalty: field!(frequency_penalty),
             presence_penalty: field!(presence_penalty),
             repetition_penalty: field!(repetition_penalty),
+            stop: field!(stop),
             stop_token_ids: field!(stop_token_ids),
             ignore_eos: sampling_field_or_default(object, "ignore_eos")
                 .map_err(serde::de::Error::custom)?,
+            include_stop_str_in_output: field!(include_stop_str_in_output),
+            skip_special_tokens: field!(skip_special_tokens),
             logit_bias: field!(logit_bias),
             allowed_token_ids: field!(allowed_token_ids),
             bad_words: field!(bad_words),
             logprob_token_ids: field!(logprob_token_ids),
             structured_outputs: field!(structured_outputs),
             skip_reading_prefix_cache: field!(skip_reading_prefix_cache),
+            cache_salt: field!(cache_salt),
             vllm_xargs: field!(vllm_xargs),
             raw,
         })
@@ -691,6 +771,18 @@ mod tests {
     }
 
     #[test]
+    fn generate_request_resolves_nested_cache_salt() {
+        let req: GenerateRequest = serde_json::from_value(json!({
+            "token_ids": [5, 6],
+            "sampling_params": {"cache_salt": "policy-7"}
+        }))
+        .expect("deserialize");
+
+        assert_eq!(req.resolved_cache_salt(), Some("policy-7"));
+        req.validate().expect("nested cache salt is valid");
+    }
+
+    #[test]
     fn generate_request_preserves_unknown_sampling_fields() {
         let raw_sampling = json!({
             "temperature": 0.5,
@@ -734,10 +826,6 @@ mod tests {
             }),
             json!({
                 "token_ids": [1],
-                "sampling_params": {"top_k": -1}
-            }),
-            json!({
-                "token_ids": [1],
                 "sampling_params": {"ignore_eos": null}
             }),
         ] {
@@ -773,9 +861,24 @@ mod tests {
             (
                 json!({
                     "token_ids": [1],
+                    "sampling_params": {"top_k": -2}
+                }),
+                "top_k",
+            ),
+            (
+                json!({
+                    "token_ids": [1],
                     "sampling_params": {"min_tokens": 3, "max_tokens": 2}
                 }),
                 "min_tokens",
+            ),
+            (
+                json!({
+                    "token_ids": [1],
+                    "sampling_params": {"cache_salt": "policy-1"},
+                    "cache_salt": "policy-2"
+                }),
+                "cache_salt",
             ),
         ];
 

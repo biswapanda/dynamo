@@ -33,7 +33,7 @@ use super::openai::{
 use super::{RouteDoc, service_v2};
 use crate::local_model::runtime_config::VLLM_INFERENCE_V1_GENERATE_CAPABILITY;
 use crate::protocols::common::preprocessor::PreprocessedRequest;
-use crate::protocols::common::{SamplingOptions, StopConditions};
+use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 use crate::protocols::openai::generate::{
     GenerateRequest, GenerateResponse, GenerateResponseOptions, SamplingParams, StreamOptions,
 };
@@ -218,13 +218,12 @@ fn preprocessed_from_generate(
     let max_tokens = sampling.max_tokens();
     let min_tokens = sampling.min_tokens();
     let ignore_eos = sampling.ignore_eos();
+    let logprobs = nonnegative_logprob_count("logprobs", sampling.logprobs())?;
+    let prompt_logprobs = nonnegative_logprob_count("prompt_logprobs", sampling.prompt_logprobs())?;
     let routing_priority = dynamo_routing_priority(request.priority);
+    let cache_salt = request.resolved_cache_salt().map(str::to_owned);
     let vllm_tito = serde_json::to_value(VllmTitoEnvelope::new(&request, request_id))?;
-    let GenerateRequest {
-        token_ids,
-        cache_salt,
-        ..
-    } = request;
+    let GenerateRequest { token_ids, .. } = request;
 
     PreprocessedRequest::builder()
         .model(model.to_string())
@@ -232,14 +231,30 @@ fn preprocessed_from_generate(
         .stop_conditions(StopConditions {
             max_tokens,
             min_tokens,
+            stop: sampling.stop(),
+            stop_token_ids: sampling.stop_token_ids(),
             ignore_eos: Some(ignore_eos),
             ..Default::default()
         })
         .sampling_options(SamplingOptions {
             n: Some(1),
+            temperature: sampling.temperature(),
+            top_p: sampling.top_p(),
+            top_k: sampling.top_k(),
+            min_p: sampling.min_p(),
+            seed: sampling.seed(),
+            presence_penalty: sampling.presence_penalty(),
+            frequency_penalty: sampling.frequency_penalty(),
+            repetition_penalty: sampling.repetition_penalty(),
+            include_stop_str_in_output: sampling.include_stop_str_in_output(),
             ..Default::default()
         })
-        .output_options(Default::default())
+        .output_options(OutputOptions {
+            logprobs,
+            prompt_logprobs,
+            skip_special_tokens: sampling.skip_special_tokens(),
+            ..Default::default()
+        })
         .routing(Some(crate::protocols::common::preprocessor::RoutingHints {
             dp_rank: data_parallel_rank,
             expected_output_tokens: max_tokens,
@@ -257,6 +272,18 @@ fn preprocessed_from_generate(
         })))
         .build()
         .map_err(|error| anyhow::anyhow!("failed to build PreprocessedRequest: {error}"))
+}
+
+fn nonnegative_logprob_count(name: &str, count: Option<i32>) -> anyhow::Result<Option<u32>> {
+    count
+        .map(|count| {
+            u32::try_from(count).map_err(|_| {
+                anyhow::anyhow!(
+                    "sampling_params.{name} must be non-negative for the Dynamo vLLM sidecar; got {count}"
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Resolve, route, and dispatch a frontend-native token-in/token-out request.
@@ -835,6 +862,22 @@ mod tests {
             "token_ids": [1, 2],
             "sampling_params": {
                 "max_tokens": 8,
+                "min_tokens": 2,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": -1,
+                "min_p": 0.1,
+                "seed": 17,
+                "presence_penalty": 0.2,
+                "frequency_penalty": 0.3,
+                "repetition_penalty": 1.1,
+                "stop": ["done"],
+                "stop_token_ids": [3, 4],
+                "ignore_eos": false,
+                "logprobs": 0,
+                "prompt_logprobs": 1,
+                "skip_special_tokens": false,
+                "include_stop_str_in_output": true,
                 "future_sampling_field": {"nested": true}
             },
             "model": "test-model",
@@ -853,7 +896,31 @@ mod tests {
             preprocessed_from_generate(request, "test-model", None, "resolved-request")
                 .expect("build request");
         assert_eq!(preprocessed.stop_conditions.max_tokens, Some(8));
-        assert_eq!(preprocessed.stop_conditions.min_tokens, None);
+        assert_eq!(preprocessed.stop_conditions.min_tokens, Some(2));
+        assert_eq!(
+            preprocessed.stop_conditions.stop.as_deref(),
+            Some(["done".to_string()].as_slice())
+        );
+        assert_eq!(
+            preprocessed.stop_conditions.stop_token_ids.as_deref(),
+            Some([3, 4].as_slice())
+        );
+        assert_eq!(preprocessed.stop_conditions.ignore_eos, Some(false));
+        assert_eq!(preprocessed.sampling_options.temperature, Some(0.7));
+        assert_eq!(preprocessed.sampling_options.top_p, Some(0.8));
+        assert_eq!(preprocessed.sampling_options.top_k, Some(-1));
+        assert_eq!(preprocessed.sampling_options.min_p, Some(0.1));
+        assert_eq!(preprocessed.sampling_options.seed, Some(17));
+        assert_eq!(preprocessed.sampling_options.presence_penalty, Some(0.2));
+        assert_eq!(preprocessed.sampling_options.frequency_penalty, Some(0.3));
+        assert_eq!(preprocessed.sampling_options.repetition_penalty, Some(1.1));
+        assert_eq!(
+            preprocessed.sampling_options.include_stop_str_in_output,
+            Some(true)
+        );
+        assert_eq!(preprocessed.output_options.logprobs, Some(0));
+        assert_eq!(preprocessed.output_options.prompt_logprobs, Some(1));
+        assert_eq!(preprocessed.output_options.skip_special_tokens, Some(false));
         assert_eq!(
             preprocessed
                 .routing
