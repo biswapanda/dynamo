@@ -109,7 +109,10 @@ impl DiscoveredModel {
         self.server.rl_capabilities.as_ref()
     }
 
-    pub(crate) fn rl_worker_metadata(&self) -> Result<RlWorkerMetadata, DynamoError> {
+    pub(crate) fn rl_worker_metadata(
+        &self,
+        admin_base_url: Option<String>,
+    ) -> Result<RlWorkerMetadata, DynamoError> {
         let parallelism = self.server.parallelism.as_ref().ok_or_else(|| {
             client::protocol_error("RL discovery requires vLLM parallelism metadata")
         })?;
@@ -128,7 +131,7 @@ impl DiscoveredModel {
                     .weight_transfer_enabled
                     .then(|| capabilities.weight_transfer_backend.clone())
             });
-        RlWorkerMetadata::new(world_size, backend)
+        RlWorkerMetadata::new(world_size, backend, admin_base_url)
             .map_err(|error| client::protocol_error(error.to_string()))
     }
 

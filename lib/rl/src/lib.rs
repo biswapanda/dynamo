@@ -105,6 +105,8 @@ pub struct RlWorkerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub routes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,6 +334,7 @@ async fn describe_worker(
             model,
             routes.routes,
             routes.system_url,
+            routes.admin_base_url,
             routes.world_size,
             routes.weight_transfer_backend,
             None,
@@ -343,12 +346,14 @@ async fn describe_worker(
             None,
             None,
             None,
+            None,
             Some(err.to_string()),
         ),
         Err(_) => worker_info(
             endpoint,
             model,
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -364,6 +369,7 @@ async fn describe_worker(
 struct WorkerRoutes {
     routes: Vec<String>,
     system_url: Option<String>,
+    admin_base_url: Option<String>,
     world_size: Option<u32>,
     weight_transfer_backend: Option<String>,
 }
@@ -472,6 +478,13 @@ fn parse_worker_routes(value: serde_json::Value) -> anyhow::Result<WorkerRoutes>
         .filter(|url| !url.is_empty())
         .map(ToString::to_string);
 
+    let admin_base_url = value
+        .get("admin_base_url")
+        .and_then(|url| url.as_str())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToString::to_string);
+
     let world_size = value
         .get("world_size")
         .map(|value| {
@@ -501,6 +514,7 @@ fn parse_worker_routes(value: serde_json::Value) -> anyhow::Result<WorkerRoutes>
     Ok(WorkerRoutes {
         routes,
         system_url,
+        admin_base_url,
         world_size,
         weight_transfer_backend,
     })
@@ -511,6 +525,7 @@ fn worker_info(
     model: Option<String>,
     mut routes: Vec<String>,
     system_url: Option<String>,
+    admin_base_url: Option<String>,
     world_size: Option<u32>,
     weight_transfer_backend: Option<String>,
     error: Option<String>,
@@ -526,6 +541,7 @@ fn worker_info(
         instance_id: endpoint.instance_id,
         transport: endpoint.transport,
         system_url,
+        admin_base_url,
         model,
         routes,
         world_size,
@@ -604,6 +620,7 @@ mod tests {
         let parsed = parse_worker_routes(json!({
             "routes": ["pause_generation", "resume_generation"],
             "system_url": "  http://worker:8080  ",
+            "admin_base_url": "  http://worker:8120  ",
             "world_size": 4,
             "weight_transfer_backend": " nccl ",
         }))
@@ -612,6 +629,7 @@ mod tests {
         assert_eq!(routes, ["pause_generation", "resume_generation"]);
         // system_url is trimmed.
         assert_eq!(parsed.system_url.as_deref(), Some("http://worker:8080"));
+        assert_eq!(parsed.admin_base_url.as_deref(), Some("http://worker:8120"));
         assert_eq!(parsed.world_size, Some(4));
         assert_eq!(parsed.weight_transfer_backend.as_deref(), Some("nccl"));
     }

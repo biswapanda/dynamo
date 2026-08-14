@@ -463,9 +463,15 @@ fn server_info() -> pb::ServerInfo {
 fn discovered_model_reports_rl_worker_metadata() {
     let model = DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery");
     assert_eq!(
-        model.rl_worker_metadata().expect("valid RL metadata"),
-        dynamo_backend_common::RlWorkerMetadata::new(4, Some("nccl".to_string()))
-            .expect("valid expected metadata")
+        model
+            .rl_worker_metadata(Some("http://worker:8120".to_string()))
+            .expect("valid RL metadata"),
+        dynamo_backend_common::RlWorkerMetadata::new(
+            4,
+            Some("nccl".to_string()),
+            Some("http://worker:8120".to_string()),
+        )
+        .expect("valid expected metadata")
     );
 }
 
