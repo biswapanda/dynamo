@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -46,6 +46,8 @@ struct FakeVllm {
     release_first_token: Arc<Notify>,
     server_stream_dropped: Arc<AtomicBool>,
     control_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    paused: Arc<AtomicBool>,
+    sleeping: Arc<AtomicBool>,
     weight_version: Arc<Mutex<String>>,
 }
 
@@ -278,6 +280,7 @@ impl pb::control_server::Control for FakeVllm {
             json!({"mode": request.mode, "clear_cache": request.clear_cache}),
         )
         .await;
+        self.paused.store(true, Ordering::SeqCst);
         Ok(Response::new(pb::PauseGenerationResponse {}))
     }
 
@@ -285,35 +288,51 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         _request: Request<pb::ResumeGenerationRequest>,
     ) -> Result<Response<pb::ResumeGenerationResponse>, Status> {
-        unimplemented_rl_rpc()
+        self.record_control("resume_generation", json!({})).await;
+        self.paused.store(false, Ordering::SeqCst);
+        Ok(Response::new(pb::ResumeGenerationResponse {}))
     }
 
     async fn is_paused(
         &self,
         _request: Request<pb::IsPausedRequest>,
     ) -> Result<Response<pb::IsPausedResponse>, Status> {
-        unimplemented_rl_rpc()
+        Ok(Response::new(pb::IsPausedResponse {
+            paused: self.paused.load(Ordering::SeqCst),
+        }))
     }
 
     async fn sleep(
         &self,
-        _request: Request<pb::SleepRequest>,
+        request: Request<pb::SleepRequest>,
     ) -> Result<Response<pb::SleepResponse>, Status> {
-        unimplemented_rl_rpc()
+        let request = request.into_inner();
+        self.record_control(
+            "sleep",
+            json!({"level": request.level, "mode": request.mode}),
+        )
+        .await;
+        self.sleeping.store(true, Ordering::SeqCst);
+        Ok(Response::new(pb::SleepResponse {}))
     }
 
     async fn wake_up(
         &self,
-        _request: Request<pb::WakeUpRequest>,
+        request: Request<pb::WakeUpRequest>,
     ) -> Result<Response<pb::WakeUpResponse>, Status> {
-        unimplemented_rl_rpc()
+        self.record_control("wake_up", json!({"tags": request.into_inner().tags}))
+            .await;
+        self.sleeping.store(false, Ordering::SeqCst);
+        Ok(Response::new(pb::WakeUpResponse {}))
     }
 
     async fn is_sleeping(
         &self,
         _request: Request<pb::IsSleepingRequest>,
     ) -> Result<Response<pb::IsSleepingResponse>, Status> {
-        unimplemented_rl_rpc()
+        Ok(Response::new(pb::IsSleepingResponse {
+            sleeping: self.sleeping.load(Ordering::SeqCst),
+        }))
     }
 
     async fn init_weight_transfer_engine(
@@ -331,14 +350,17 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         _request: Request<pb::StartWeightUpdateRequest>,
     ) -> Result<Response<pb::StartWeightUpdateResponse>, Status> {
-        unimplemented_rl_rpc()
+        self.record_control("start_weight_update", json!({})).await;
+        Ok(Response::new(pb::StartWeightUpdateResponse {}))
     }
 
     async fn start_draft_weight_update(
         &self,
         _request: Request<pb::StartDraftWeightUpdateRequest>,
     ) -> Result<Response<pb::StartDraftWeightUpdateResponse>, Status> {
-        unimplemented_rl_rpc()
+        self.record_control("start_draft_weight_update", json!({}))
+            .await;
+        Ok(Response::new(pb::StartDraftWeightUpdateResponse {}))
     }
 
     async fn update_weights(
@@ -366,9 +388,13 @@ impl pb::control_server::Control for FakeVllm {
 
     async fn update_weight_version(
         &self,
-        _request: Request<pb::UpdateWeightVersionRequest>,
+        request: Request<pb::UpdateWeightVersionRequest>,
     ) -> Result<Response<pb::UpdateWeightVersionResponse>, Status> {
-        unimplemented_rl_rpc()
+        let version = request.into_inner().weight_version;
+        self.weight_version.lock().await.clone_from(&version);
+        self.record_control("update_weight_version", json!({"weight_version": version}))
+            .await;
+        Ok(Response::new(pb::UpdateWeightVersionResponse {}))
     }
 
     async fn get_weight_version(
@@ -379,13 +405,6 @@ impl pb::control_server::Control for FakeVllm {
             weight_version: self.weight_version.lock().await.clone(),
         }))
     }
-}
-
-#[allow(clippy::result_large_err)]
-fn unimplemented_rl_rpc<T>() -> Result<Response<T>, Status> {
-    Err(Status::unimplemented(
-        "RL RPC is outside this test's contract",
-    ))
 }
 
 fn model_info() -> pb::ModelInfo {
@@ -902,35 +921,114 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
 
     assert_eq!(
         engine
-            .engine_control(
-                "pause_generation".to_string(),
-                json!({"mode": "keep", "clear_cache": false}),
-            )
+            .supported_controls()
             .await
-            .unwrap(),
-        json!({"status": "paused"})
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        [
+            "get_weight_version",
+            "is_paused",
+            "is_sleeping",
+            "pause_generation",
+            "resume_generation",
+            "sleep",
+            "wake_up",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     );
-    engine
-        .engine_update(
-            "init_weight_transfer_engine".to_string(),
+    assert_eq!(
+        engine
+            .supported_updates()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        [
+            "finish_weight_update",
+            "init_weight_transfer_engine",
+            "start_draft_weight_update",
+            "start_weight_update",
+            "update_weight_version",
+            "update_weights",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
+
+    for (control, body, expected) in [
+        ("is_paused", json!({}), json!({"is_paused": false})),
+        (
+            "pause_generation",
+            json!({"mode": "keep", "clear_cache": false}),
+            json!({"status": "paused"}),
+        ),
+        ("is_paused", json!({}), json!({"is_paused": true})),
+        ("resume_generation", json!({}), json!({"status": "resumed"})),
+        ("is_paused", json!({}), json!({"is_paused": false})),
+        ("is_sleeping", json!({}), json!({"is_sleeping": false})),
+        (
+            "sleep",
+            json!({"level": 2, "mode": "wait"}),
+            json!({"status": "sleeping"}),
+        ),
+        ("is_sleeping", json!({}), json!({"is_sleeping": true})),
+        (
+            "wake_up",
+            json!({"tags": ["weights"]}),
+            json!({"status": "awake"}),
+        ),
+        ("is_sleeping", json!({}), json!({"is_sleeping": false})),
+    ] {
+        assert_eq!(
+            engine
+                .engine_control(control.to_string(), body)
+                .await
+                .unwrap(),
+            expected,
+            "unexpected {control} response"
+        );
+    }
+
+    for (update, body, expected) in [
+        (
+            "init_weight_transfer_engine",
             json!({"init_info": {"master_addr": "trainer", "master_port": 1234}}),
-        )
-        .await
-        .unwrap();
-    engine
-        .engine_update(
-            "update_weights".to_string(),
+            json!({"message": "Weight transfer initialized"}),
+        ),
+        (
+            "start_weight_update",
+            json!({}),
+            json!({"message": "Weight update started"}),
+        ),
+        (
+            "start_draft_weight_update",
+            json!({}),
+            json!({"message": "Draft weight update started"}),
+        ),
+        (
+            "update_weights",
             json!({"update_info": {"names": ["layer.weight"], "shape": [4, 8]}}),
-        )
-        .await
-        .unwrap();
-    engine
-        .engine_update(
-            "finish_weight_update".to_string(),
+            json!({"message": "Weights updated"}),
+        ),
+        (
+            "finish_weight_update",
             json!({"weight_version": "step-42"}),
-        )
-        .await
-        .unwrap();
+            json!({"message": "Weight update finished"}),
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .engine_update(update.to_string(), body)
+                .await
+                .unwrap(),
+            expected,
+            "unexpected {update} response"
+        );
+    }
     assert_eq!(
         engine
             .engine_control("get_weight_version".to_string(), json!({}))
@@ -938,28 +1036,58 @@ async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
             .unwrap(),
         json!({"weight_version": "step-42"})
     );
-
     assert_eq!(
-        *server.service.control_calls.lock().await,
-        vec![
-            (
-                "pause_generation".to_string(),
-                json!({"mode": pb::PauseMode::Keep as i32, "clear_cache": false}),
-            ),
-            (
-                "init_weight_transfer_engine".to_string(),
-                json!({"master_addr": "trainer", "master_port": 1234}),
-            ),
-            (
-                "update_weights".to_string(),
-                json!({"names": ["layer.weight"], "shape": [4, 8]}),
-            ),
-            (
-                "finish_weight_update".to_string(),
-                json!({"weight_version": "step-42"}),
-            ),
-        ]
+        engine
+            .engine_update(
+                "update_weight_version".to_string(),
+                json!({"new_version": "step-43"}),
+            )
+            .await
+            .unwrap(),
+        json!({"success": true, "new_version": "step-43"})
     );
+    assert_eq!(
+        engine
+            .engine_control("get_weight_version".to_string(), json!({}))
+            .await
+            .unwrap(),
+        json!({"weight_version": "step-43"})
+    );
+
+    let calls = server.service.control_calls.lock().await;
+    let actual = calls.iter().cloned().collect::<BTreeMap<_, _>>();
+    let expected = BTreeMap::from([
+        (
+            "pause_generation".to_string(),
+            json!({"mode": pb::PauseMode::Keep as i32, "clear_cache": false}),
+        ),
+        ("resume_generation".to_string(), json!({})),
+        (
+            "sleep".to_string(),
+            json!({"level": 2, "mode": pb::PauseMode::Wait as i32}),
+        ),
+        ("wake_up".to_string(), json!({"tags": ["weights"]})),
+        (
+            "init_weight_transfer_engine".to_string(),
+            json!({"master_addr": "trainer", "master_port": 1234}),
+        ),
+        ("start_weight_update".to_string(), json!({})),
+        ("start_draft_weight_update".to_string(), json!({})),
+        (
+            "update_weights".to_string(),
+            json!({"names": ["layer.weight"], "shape": [4, 8]}),
+        ),
+        (
+            "finish_weight_update".to_string(),
+            json!({"weight_version": "step-42"}),
+        ),
+        (
+            "update_weight_version".to_string(),
+            json!({"weight_version": "step-43"}),
+        ),
+    ]);
+    assert_eq!(calls.len(), expected.len(), "each mutating RPC runs once");
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]
