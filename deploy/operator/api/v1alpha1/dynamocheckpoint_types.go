@@ -43,58 +43,54 @@ const (
 // +kubebuilder:validation:Enum=pvc;s3;oci
 type DynamoCheckpointStorageType string
 
-// DynamoCheckpointIdentity is legacy compatibility metadata for standalone
-// DynamoCheckpoint objects. DGD-managed automatic checkpoints do not use this
-// shape as a reuse boundary; they use an operator-owned checkpoint ID instead.
+// Deprecated: legacy identity metadata. Keep it only where v1alpha1 still
+// requires spec.identity; omit DGD-managed identity and use checkpointRef for
+// explicit restores.
 type DynamoCheckpointIdentity struct {
 	// Model is the model identifier (e.g., "meta-llama/Llama-3-70B")
+	// Deprecated: legacy spec.identity only.
 	// +kubebuilder:validation:Required
 	Model string `json:"model"`
 
 	// BackendFramework is the runtime framework (vllm, sglang, trtllm)
+	// Deprecated: legacy spec.identity only.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=vllm;sglang;trtllm
 	BackendFramework string `json:"backendFramework"`
 
 	// DynamoVersion is the Dynamo platform version (optional).
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: legacy spec.identity only.
 	// +optional
 	DynamoVersion string `json:"dynamoVersion,omitempty"`
 
 	// TensorParallelSize is the tensor parallel configuration.
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: checkpoint launch uses the pod template instead.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	TensorParallelSize int32 `json:"tensorParallelSize,omitempty"`
 
 	// PipelineParallelSize is the pipeline parallel configuration.
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: checkpoint launch uses the pod template instead.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	PipelineParallelSize int32 `json:"pipelineParallelSize,omitempty"`
 
 	// Dtype is the data type (fp16, bf16, fp8, etc.).
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: legacy spec.identity only.
 	// +optional
 	Dtype string `json:"dtype,omitempty"`
 
 	// MaxModelLen is the maximum sequence length.
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: legacy spec.identity only.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	MaxModelLen int32 `json:"maxModelLen,omitempty"`
 
 	// ExtraParameters are additional parameters that affect the checkpoint hash.
 	// Use for any framework-specific or custom parameters not covered above.
-	// Deprecated for DGD-managed automatic checkpoints; it only participates in
-	// the legacy identity hash fallback for standalone objects.
+	// Deprecated: legacy spec.identity only.
 	// +optional
 	ExtraParameters map[string]string `json:"extraParameters,omitempty"`
 }
@@ -133,8 +129,8 @@ type DynamoCheckpointJobConfig struct {
 	// +kubebuilder:validation:Minimum=0
 	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
 
-	// Deprecated: TTLSecondsAfterFinished is ignored. Checkpoint Jobs use a fixed
-	// 300 second TTL.
+	// Deprecated: TTLSecondsAfterFinished is ignored. The operator deletes checkpoint
+	// Jobs after recording their terminal outcome.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
@@ -142,8 +138,8 @@ type DynamoCheckpointJobConfig struct {
 
 // DynamoCheckpointSpec defines the desired state of DynamoCheckpoint
 type DynamoCheckpointSpec struct {
-	// Identity is legacy compatibility metadata. DGD-managed automatic
-	// checkpoints use an operator-owned checkpoint ID instead.
+	// Deprecated: required by v1alpha1 for standalone checkpoints. Auto
+	// checkpoints synthesize it; checkpointRef restores use the referenced CR.
 	// +kubebuilder:validation:Required
 	Identity DynamoCheckpointIdentity `json:"identity"`
 
@@ -203,6 +199,13 @@ type DynamoCheckpointStatus struct {
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 
+	// PodSnapshotName is the name of the PodSnapshot this checkpoint created to drive capture. It is
+	// the authoritative pointer to the snapshot (which is otherwise located by label, not by
+	// reconstructing its name) and lets the controller distinguish a never-created snapshot (empty)
+	// from one that was created and later went missing (set, but no longer found).
+	// +optional
+	PodSnapshotName string `json:"podSnapshotName,omitempty"`
+
 	// CreatedAt is the timestamp when the checkpoint became ready
 	// +optional
 	CreatedAt *metav1.Time `json:"createdAt,omitempty"`
@@ -243,8 +246,4 @@ type DynamoCheckpointList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []DynamoCheckpoint `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&DynamoCheckpoint{}, &DynamoCheckpointList{})
 }

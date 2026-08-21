@@ -7,19 +7,18 @@ use dynamo_kv_router::{
     RouterConfigOverride,
     indexer::RoutingDecisionHashes,
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
-    scheduling::{RoutingEligibility, WorkerEligibilityError},
+    router_hint::RouterHint,
+    scheduling::RoutingEligibility,
+    selector::WorkerSelector,
 };
-use dynamo_runtime::{
-    dynamo_nvtx_range,
-    error::{DynamoError, ErrorType},
-    pipeline::Error,
-};
+use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
 use crate::{
     kv_router::{
-        FindBestMatchOutcome, push_router::KvPushRouter,
-        sticky::coordinator::sticky_allowed_for_phase,
+        FindBestMatchAdmission, FindBestMatchInnerOutcome, FindBestMatchOutcome,
+        push_router::KvPushRouter,
     },
+    local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
     protocols::{
         TokenIdType,
@@ -28,13 +27,12 @@ use crate::{
 };
 
 pub(super) struct WorkerSelection {
-    pub(super) instance_id: u64,
-    pub(super) dp_rank: u32,
+    pub(super) worker: WorkerWithDpRank,
     pub(super) overlap_amount: u32,
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
-    pub(super) scheduler_tracked: bool,
+    pub(super) router_hint: Option<RouterHint>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +51,12 @@ impl<'a> RoutingRequestParts<'a> {
     }
 }
 
+pub(super) struct SelectionOptions {
+    pub(super) affinity_worker: Option<WorkerWithDpRank>,
+    pub(super) policy_class: Option<String>,
+    pub(super) session_context: Option<dynamo_kv_router::SessionContext>,
+}
+
 struct BestMatchArgs<'a> {
     context_id: &'a str,
     routing_parts: RoutingRequestParts<'a>,
@@ -60,19 +64,25 @@ struct BestMatchArgs<'a> {
     update_states: bool,
     return_routing_hashes: bool,
     lora_name: Option<String>,
+    cache_namespace: Option<String>,
     priority_jump: f64,
+    strict_priority: u32,
+    policy_class: Option<String>,
+    session_context: Option<dynamo_kv_router::SessionContext>,
     expected_output_tokens: Option<u32>,
     pinned_worker: Option<WorkerWithDpRank>,
     allowed_worker_ids: Option<HashSet<WorkerId>>,
     routing_constraints: RoutingConstraints,
-    scheduler_tracked: bool,
 }
 
-impl KvPushRouter {
+impl<Sel> KvPushRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     async fn select_best_match(&self, args: BestMatchArgs<'_>) -> Result<WorkerSelection, Error> {
         let outcome = self
             .chooser
-            .find_best_match_details(
+            .find_best_match_details_with_policy_class_inner(
                 Some(args.context_id),
                 args.routing_parts.token_ids,
                 args.routing_parts.block_mm_infos,
@@ -80,41 +90,44 @@ impl KvPushRouter {
                 args.update_states,
                 args.return_routing_hashes,
                 args.lora_name,
+                args.cache_namespace,
                 args.priority_jump,
+                args.strict_priority,
+                args.policy_class,
+                args.session_context,
                 args.expected_output_tokens,
                 args.pinned_worker,
                 args.allowed_worker_ids,
                 args.routing_constraints,
+                FindBestMatchAdmission::WithAdmission {
+                    track_lifecycle: true,
+                },
             )
             .await?;
-
+        let outcome = match outcome {
+            FindBestMatchInnerOutcome::WithAdmission(outcome) => outcome,
+            FindBestMatchInnerOutcome::WithoutAdmission(_) => {
+                unreachable!("with-admission routing returned advisory outcome")
+            }
+        };
         match outcome {
             FindBestMatchOutcome::Routed {
                 worker,
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                potential_decode_blocks: _,
                 routing_hashes,
+                router_hint,
             } => Ok(WorkerSelection {
-                instance_id: worker.worker_id,
-                dp_rank: worker.dp_rank,
+                worker,
                 overlap_amount: overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
-                scheduler_tracked: args.scheduler_tracked,
+                router_hint,
             }),
-            FindBestMatchOutcome::Backpressure {
-                reason,
-                queued_isl_tokens,
-                max_queued_isl_tokens,
-            } => Err(DynamoError::builder()
-                .error_type(ErrorType::ResourceExhausted)
-                .message(format!(
-                    "router backpressure: {reason:?} (queued_isl_tokens={queued_isl_tokens}, max_queued_isl_tokens={max_queued_isl_tokens:?})"
-                ))
-                .build()
-                .into()),
+            FindBestMatchOutcome::QueueRejected { rejection } => Err(rejection.into()),
         }
     }
 
@@ -126,24 +139,57 @@ impl KvPushRouter {
         routing_parts: RoutingRequestParts<'_>,
         phase: RequestPhase,
         is_query_only: bool,
-        sticky_worker: Option<WorkerWithDpRank>,
+        options: SelectionOptions,
     ) -> Result<WorkerSelection, Error> {
         let _nvtx_select = dynamo_nvtx_range!("route.select_worker");
         let routing = request.routing.as_ref();
+        let explicit_pin = pinned_worker_hint(phase, routing);
         let lora_name = routing.and_then(|routing| routing.lora_name.clone());
+        let cache_namespace = routing.and_then(|routing| routing.cache_namespace.clone());
         let priority_jump = routing
             .and_then(|routing| routing.priority_jump)
             .unwrap_or(0.0);
+        let strict_priority = routing
+            .and_then(|routing| routing.strict_priority)
+            .unwrap_or(0);
         let expected_output_tokens = routing.and_then(|routing| routing.expected_output_tokens);
-        let allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
-        let return_routing_hashes =
-            !is_query_only && self.chooser.indexer().records_routing_decisions();
         let routing_constraints = routing
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
-        let sticky_pin = sticky_worker.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
+        let mut allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
+        let migration_excluded_worker_ids = request
+            .migration_state
+            .as_ref()
+            .map(|state| state.excluded_worker_ids())
+            .unwrap_or_default();
+        if explicit_pin.is_none() && !migration_excluded_worker_ids.is_empty() {
+            let workers = self.chooser.workers_with_configs.borrow();
+            let eligible =
+                allowed_worker_ids.get_or_insert_with(|| workers.keys().copied().collect());
+            eligible.retain(|worker_id| {
+                workers.get(worker_id).is_some_and(|config| {
+                    routing_constraints.is_compatible_with_worker_taints(&config.taints)
+                }) && !migration_excluded_worker_ids.contains(worker_id)
+            });
+            if eligible.is_empty()
+                && let Some(error) = request
+                    .migration_state
+                    .as_ref()
+                    .and_then(|state| state.exhausted_error())
+            {
+                return Err(anyhow::anyhow!(error));
+            }
+        }
+        let return_routing_hashes =
+            !is_query_only && self.chooser.indexer().records_routing_decisions();
+        let SelectionOptions {
+            affinity_worker,
+            policy_class,
+            session_context,
+        } = options;
+        let affinity_pin = affinity_worker.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
         let Some((pinned_worker_id, requested_dp_rank)) =
-            pinned_worker_hint(phase, routing).or(sticky_pin)
+            merge_affinity_pin(explicit_pin, affinity_pin)
         else {
             let _nvtx_kv = dynamo_nvtx_range!("route.kv_match");
             let selection = self
@@ -154,12 +200,15 @@ impl KvPushRouter {
                     update_states: !is_query_only,
                     return_routing_hashes,
                     lora_name,
+                    cache_namespace,
                     priority_jump,
+                    strict_priority,
+                    policy_class,
+                    session_context,
                     expected_output_tokens,
                     pinned_worker: None,
                     allowed_worker_ids,
                     routing_constraints: routing_constraints.clone(),
-                    scheduler_tracked: !is_query_only,
                 })
                 .await?;
 
@@ -171,13 +220,13 @@ impl KvPushRouter {
                 // tests/utils/router_logs.py parses the structured fields on this event.
                 tracing::debug!(
                     request_id = %context_id,
-                    worker_id = selection.instance_id,
-                    dp_rank = selection.dp_rank,
+                    worker_id = selection.worker.worker_id,
+                    dp_rank = selection.worker.dp_rank,
                     overlap_blocks = selection.overlap_amount,
                     total_blocks,
                     "[ROUTING] Best: worker_{} dp_rank={} with {}/{} blocks overlap",
-                    selection.instance_id,
-                    selection.dp_rank,
+                    selection.worker.worker_id,
+                    selection.worker.dp_rank,
                     selection.overlap_amount,
                     total_blocks,
                 );
@@ -185,6 +234,7 @@ impl KvPushRouter {
 
             return Ok(selection);
         };
+        let cache_namespace = routing.and_then(|routing| routing.cache_namespace.clone());
 
         let pinned_worker = resolve_pinned_worker_rank(
             pinned_worker_id,
@@ -222,90 +272,32 @@ impl KvPushRouter {
             update_states: !is_query_only,
             return_routing_hashes,
             lora_name,
+            cache_namespace,
             priority_jump,
+            strict_priority,
+            policy_class,
+            session_context,
             expected_output_tokens,
             pinned_worker: Some(pinned_worker),
             allowed_worker_ids,
             routing_constraints,
-            scheduler_tracked: !is_query_only,
         })
         .await
     }
+}
 
-    fn sticky_worker_ineligibility_for_phase(
-        &self,
-        request: &PreprocessedRequest,
-        phase: RequestPhase,
-        worker: WorkerWithDpRank,
-    ) -> Option<WorkerEligibilityError> {
-        let routing = request.routing.as_ref()?;
-        if !sticky_allowed_for_phase(phase, Some(routing)) {
-            return None;
+fn merge_affinity_pin(
+    explicit: Option<(u64, Option<u32>)>,
+    affinity: Option<(u64, Option<u32>)>,
+) -> Option<(u64, Option<u32>)> {
+    match (explicit, affinity) {
+        (Some((worker_id, None)), Some((affinity_worker_id, affinity_rank)))
+            if worker_id == affinity_worker_id =>
+        {
+            Some((worker_id, affinity_rank))
         }
-
-        let default_constraints = RoutingConstraints::default();
-        let routing_constraints = routing
-            .routing_constraints
-            .as_ref()
-            .unwrap_or(&default_constraints);
-        let configs = self.chooser.workers_with_configs.borrow();
-        let eligibility = RoutingEligibility::new(
-            routing.allowed_worker_ids.as_ref(),
-            None,
-            Some(worker),
-            routing_constraints,
-        );
-        eligibility.validate_worker_rank(&configs, worker).err()
-    }
-
-    pub(crate) fn unbind_ineligible_sticky_worker_for_phase(
-        &self,
-        context_id: &str,
-        request: &PreprocessedRequest,
-        phase: RequestPhase,
-        worker: WorkerWithDpRank,
-    ) -> bool {
-        let Some(reason) = self.sticky_worker_ineligibility_for_phase(request, phase, worker)
-        else {
-            return false;
-        };
-
-        let Some((session_id, _binding)) = self.sticky.unbind_for_phase(request, phase) else {
-            return false;
-        };
-        tracing::warn!(
-            request_id = %context_id,
-            %session_id,
-            worker_id = worker.worker_id,
-            dp_rank = worker.dp_rank,
-            reason = %reason,
-            "Sticky worker is no longer eligible; removing session affinity"
-        );
-        true
-    }
-
-    pub(crate) async fn validate_sticky_worker_for_phase(
-        &self,
-        context_id: &str,
-        request: &PreprocessedRequest,
-        phase: RequestPhase,
-        worker: WorkerWithDpRank,
-    ) -> Result<WorkerWithDpRank, Error> {
-        let routing_parts = RoutingRequestParts::new(request);
-        let selection = self
-            .select_worker(
-                context_id,
-                request,
-                routing_parts,
-                phase,
-                true,
-                Some(worker),
-            )
-            .await?;
-        Ok(WorkerWithDpRank::new(
-            selection.instance_id,
-            selection.dp_rank,
-        ))
+        (Some(explicit), _) => Some(explicit),
+        (None, affinity) => affinity,
     }
 }
 
@@ -339,7 +331,7 @@ fn pinned_worker_hint(
             Some((worker_id, routing.dp_rank))
         }
         RequestPhase::Aggregated => {
-            let worker_id = routing.backend_instance_id?;
+            let worker_id = routing.decode_worker_id.or(routing.backend_instance_id)?;
             Some((worker_id, routing.dp_rank))
         }
     }
@@ -354,7 +346,7 @@ mod tests {
         scheduling::{RoutingEligibility, WorkerEligibilityError},
     };
 
-    use super::{pinned_worker_hint, resolve_pinned_worker_rank};
+    use super::{merge_affinity_pin, pinned_worker_hint, resolve_pinned_worker_rank};
     use crate::{
         local_model::runtime_config::ModelRuntimeConfig,
         protocols::common::{preprocessor::RoutingHints, timing::RequestPhase},
@@ -380,6 +372,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires an explicit dp_rank"));
+    }
+
+    #[test]
+    fn affinity_pin_supplies_rank_for_matching_explicit_worker() {
+        assert_eq!(
+            merge_affinity_pin(Some((7, None)), Some((7, Some(0)))),
+            Some((7, Some(0)))
+        );
+        assert_eq!(
+            merge_affinity_pin(Some((7, Some(2))), Some((7, Some(3)))),
+            Some((7, Some(2)))
+        );
     }
 
     #[test]
@@ -414,28 +418,29 @@ mod tests {
     }
 
     #[test]
-    fn pinned_worker_hint_aggregated_uses_backend_worker() {
+    fn pinned_worker_hint_aggregated_uses_decode_worker_before_backend() {
         let routing = RoutingHints {
             backend_instance_id: Some(9),
+            decode_worker_id: Some(5),
             dp_rank: Some(7),
             ..Default::default()
         };
 
         assert_eq!(
             pinned_worker_hint(RequestPhase::Aggregated, Some(&routing)),
-            Some((9, Some(7)))
+            Some((5, Some(7)))
         );
     }
 
     #[test]
-    fn sticky_validation_style_ignores_transient_overload() {
+    fn affinity_validation_ignores_transient_overload() {
         let worker = WorkerWithDpRank::new(7, 0);
         let configs = HashMap::from([(7, ModelRuntimeConfig::default())]);
         let constraints = RoutingConstraints::default();
         let overloaded = HashSet::from([7]);
         let scheduling_eligibility =
             RoutingEligibility::new(None, Some(&overloaded), Some(worker), &constraints);
-        let sticky_eligibility = RoutingEligibility::new(None, None, Some(worker), &constraints);
+        let affinity_eligibility = RoutingEligibility::new(None, None, Some(worker), &constraints);
 
         assert_eq!(
             scheduling_eligibility
@@ -444,7 +449,7 @@ mod tests {
             Some(WorkerEligibilityError::WorkerOverloaded { worker_id: 7 })
         );
         assert!(
-            sticky_eligibility
+            affinity_eligibility
                 .validate_worker_rank(&configs, worker)
                 .is_ok()
         );

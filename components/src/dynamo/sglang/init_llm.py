@@ -14,6 +14,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
 from dynamo.llm import ModelInput, ModelType, WorkerType
 from dynamo.runtime import DistributedRuntime
+from dynamo.sglang._compat import override_server_args
 from dynamo.sglang.args import Config
 from dynamo.sglang.health_check import (
     SglangDisaggHealthCheckPayload,
@@ -33,8 +34,8 @@ async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
     """Perform warmup request for prefill engine to reduce initial TTFT.
 
     Raises on failure so the caller can prevent the worker from registering
-    with a broken engine (silent request drops). Shared with the unified
-    backend (`dynamo.sglang.llm_engine`) via `_disagg.warmup_prefill_engine`.
+    with a broken engine (silent request drops). Delegates to
+    `_disagg.warmup_prefill_engine`.
     """
     from dynamo.sglang._disagg import warmup_prefill_engine
 
@@ -57,6 +58,9 @@ async def init_decode(
     generate_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
     )
+    clear_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.clear_kv_blocks"
+    )
 
     # Use pre-created engine if provided (snapshot mode)
     if snapshot_engine is not None:
@@ -68,7 +72,11 @@ async def init_decode(
                 "created before the endpoint existed, so its FPM publisher bound "
                 "a different IPC path than the relay would subscribe to."
             )
-            server_args.enable_forward_pass_metrics = False
+            override_server_args(
+                server_args,
+                "dynamo.snapshot",
+                enable_forward_pass_metrics=False,
+            )
     else:
         set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
         start_time = time.time()
@@ -132,13 +140,6 @@ async def init_decode(
             "The chat template will be loaded but the /v1/chat/completions endpoint will not be available."
         )
 
-    # Only serve session_control when streaming sessions are enabled.
-    if getattr(server_args, "enable_streaming_session", False):
-        session_control_endpoint = runtime.endpoint(
-            f"{dynamo_args.namespace}.{dynamo_args.component}.session_control"
-        )
-        shutdown_endpoints.append(session_control_endpoint)
-
     # Worker type and needs, derived from serving_mode.
     if config.serving_mode == DisaggregationMode.DECODE:
         decode_worker_type = WorkerType.Decode
@@ -167,6 +168,10 @@ async def init_decode(
                 handler.list_loras,
                 metrics_labels=metrics_labels,
             ),
+            clear_endpoint.serve_endpoint(
+                handler.clear_kv_blocks,
+                metrics_labels=metrics_labels,
+            ),
             register_model_with_readiness_gate(
                 engine,
                 generate_endpoint,
@@ -176,12 +181,10 @@ async def init_decode(
                 readiness_gate=ready_event,
                 worker_type=decode_worker_type,
                 needs=decode_needs,
+                # Decode workers serve the LoRA load endpoints, so they may advertise capacity.
+                serves_lora_load=True,
             ),
         ]
-        if getattr(server_args, "enable_streaming_session", False):
-            gather_tasks.append(
-                session_control_endpoint.serve_endpoint(handler.session_control)
-            )
         await asyncio.gather(*gather_tasks)
     except Exception as e:
         logging.error(f"Failed to serve endpoints: {e}")
@@ -215,6 +218,9 @@ async def init_prefill(
     generate_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
     )
+    clear_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.clear_kv_blocks"
+    )
 
     # Use pre-created engine if provided (snapshot mode)
     if snapshot_engine is not None:
@@ -226,7 +232,11 @@ async def init_prefill(
                 "created before the endpoint existed, so its FPM publisher bound "
                 "a different IPC path than the relay would subscribe to."
             )
-            server_args.enable_forward_pass_metrics = False
+            override_server_args(
+                server_args,
+                "dynamo.snapshot",
+                enable_forward_pass_metrics=False,
+            )
     else:
         set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
         start_time = time.time()
@@ -301,6 +311,10 @@ async def init_prefill(
                 handler.list_loras,
                 metrics_labels=metrics_labels,
             ),
+            clear_endpoint.serve_endpoint(
+                handler.clear_kv_blocks,
+                metrics_labels=metrics_labels,
+            ),
             register_model_with_readiness_gate(
                 engine,
                 generate_endpoint,
@@ -317,6 +331,9 @@ async def init_prefill(
                 readiness_gate=ready_event,
                 worker_type=WorkerType.Prefill,
                 needs=[[WorkerType.Decode]],
+                # Prefill workers also serve the LoRA load endpoints (init_prefill), so they may
+                # advertise capacity.
+                serves_lora_load=True,
             ),
         )
     except Exception as e:

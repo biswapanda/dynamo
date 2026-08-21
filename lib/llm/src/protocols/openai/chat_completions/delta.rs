@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use super::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse};
 use crate::{
     protocols::{
-        common::{self, timing::RequestTracker},
+        common::{self, extensions::NvExtProvider, timing::RequestTracker},
         openai::{
             convert_backend_top_logprobs,
             delta_common::{self, DeltaGeneratorOptions},
-            nvext::NvExtProvider,
             token_to_utf8_bytes,
         },
     },
@@ -53,8 +52,8 @@ pub struct DeltaGenerator {
     service_tier: Option<dynamo_protocols::types::ServiceTierResponse>,
     /// Tracks token usage for the completion request.
     usage: dynamo_protocols::types::CompletionUsage,
-    /// Counter tracking the number of messages issued.
-    msg_counter: u64,
+    /// Choice indices for which the assistant role has already been emitted.
+    emitted_role_choices: HashSet<u32>,
     /// Configuration options for response generation.
     options: DeltaGeneratorOptions,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
@@ -72,7 +71,7 @@ impl DeltaGenerator {
             system_fingerprint: None,
             service_tier: None,
             usage,
-            msg_counter: 0,
+            emitted_role_choices: HashSet::new(),
             options,
             tracker,
         }
@@ -129,6 +128,7 @@ impl DeltaGenerator {
                     dynamo_protocols::types::ChatCompletionTokenLogprob {
                         token: token_str.clone(),
                         logprob: lp,
+                        token_id: Some(*tid),
                         bytes: token_to_utf8_bytes(&token_str),
                         top_logprobs: converted,
                     }
@@ -154,11 +154,10 @@ impl DeltaGenerator {
             content: text.map(dynamo_protocols::types::ChatCompletionMessageContent::Text),
             function_call: None,
             tool_calls: None,
-            role: if self.msg_counter == 0 {
-                Some(dynamo_protocols::types::Role::Assistant)
-            } else {
-                None
-            },
+            role: self
+                .emitted_role_choices
+                .insert(index)
+                .then_some(dynamo_protocols::types::Role::Assistant),
             refusal: None,
             reasoning_content: None,
         };
@@ -171,7 +170,6 @@ impl DeltaGenerator {
         };
 
         let choices = vec![choice];
-
         // According to OpenAI spec: when stream_options.include_usage is true,
         // all intermediate chunks should have usage: null
         // The final usage chunk will be sent separately with empty choices
@@ -191,6 +189,7 @@ impl DeltaGenerator {
                 service_tier: self.service_tier.clone(),
             },
             nvext: None, // Will be populated by router layer if needed
+            llm_metrics: None,
         }
     }
 
@@ -198,7 +197,7 @@ impl DeltaGenerator {
     /// This should be sent after the last content chunk when stream_options.include_usage is true.
     ///
     /// # Returns
-    /// * A [`CreateChatCompletionStreamResponse`] with empty choices and usage stats.
+    /// * A `CreateChatCompletionStreamResponse` with empty choices and usage stats.
     pub fn create_usage_chunk(&self) -> NvCreateChatCompletionStreamResponse {
         let usage = self.get_usage();
 
@@ -214,6 +213,7 @@ impl DeltaGenerator {
                 service_tier: self.service_tier.clone(),
             },
             nvext: None,
+            llm_metrics: None,
         }
     }
 
@@ -268,6 +268,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
                 self.usage.prompt_tokens_details = Some(prompt_details.clone());
             }
+
+            // Propagate completion token details if provided, including reasoning tokens.
+            if let Some(completion_details) = completion_usage.completion_tokens_details.as_ref() {
+                self.usage.completion_tokens_details = Some(completion_details.clone());
+            }
         }
 
         let logprobs = self.create_logprobs(
@@ -316,7 +321,6 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         let completion_token_ids_slice: &[u32] = &delta.token_ids;
         if let Some(nvext_response) = self.options.response_fields.build_response_nvext(
             Some(&self.tracker),
-            delta.disaggregated_params.as_ref(),
             finish_reason.is_some(),
             delta.engine_data,
             stop_reason,
@@ -381,7 +385,8 @@ mod tests {
     use crate::protocols::openai::DeltaGeneratorExt;
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
+        ChatCompletionRequestUserMessageContent, CompletionTokensDetails, CompletionUsage,
+        CreateChatCompletionRequest,
     };
 
     fn create_test_request() -> NvCreateChatCompletionRequest {
@@ -447,7 +452,7 @@ mod tests {
     }
 
     fn make_request_with_nvext(
-        nvext: crate::protocols::openai::nvext::NvExt,
+        nvext: crate::protocols::common::extensions::NvExt,
     ) -> NvCreateChatCompletionRequest {
         let mut request = create_test_request();
         request.nvext = Some(nvext);
@@ -466,14 +471,110 @@ mod tests {
             stop_reason: None,
             index: Some(0),
             completion_usage: None,
-            disaggregated_params: Some(serde_json::json!({
-                "token_ids": [11, 22, 33],
+            disaggregated_params: None,
+            worker_trace_link: None,
+            // routed_experts rides the engine's opaque passthrough.
+            engine_data: Some(serde_json::json!({
                 "routed_experts": {"layer_0": [1, 3]}
             })),
-            worker_trace_link: None,
-            engine_data: None,
+            encoder_result: None,
             routing_data: None,
         }
+    }
+
+    #[test]
+    fn test_completion_token_details_are_propagated_from_backend_usage() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-token-details".to_string());
+
+        let mut backend_output = final_backend_output();
+        backend_output.completion_usage = Some(CompletionUsage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            prompt_tokens_details: None,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(3),
+                ..Default::default()
+            }),
+        });
+
+        generator
+            .choice_from_postprocessor(backend_output)
+            .expect("choice generation");
+
+        let usage = generator.get_usage();
+        let completion_details = usage
+            .completion_tokens_details
+            .expect("completion token details should be propagated");
+
+        assert_eq!(completion_details.reasoning_tokens, Some(3));
+    }
+
+    #[test]
+    fn test_role_is_emitted_once_per_choice() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-stream-role".to_string());
+
+        let first_choice_zero = generator
+            .choice_from_postprocessor(final_backend_output())
+            .expect("first choice 0 generation");
+
+        let mut choice_one_output = final_backend_output();
+        choice_one_output.index = Some(1);
+        let first_choice_one = generator
+            .choice_from_postprocessor(choice_one_output)
+            .expect("first choice 1 generation");
+
+        let second_choice_zero = generator
+            .choice_from_postprocessor(final_backend_output())
+            .expect("second choice 0 generation");
+
+        let mut choice_one_output = final_backend_output();
+        choice_one_output.index = Some(1);
+        let second_choice_one = generator
+            .choice_from_postprocessor(choice_one_output)
+            .expect("second choice 1 generation");
+
+        assert_eq!(
+            first_choice_zero.inner.choices[0].delta.role,
+            Some(dynamo_protocols::types::Role::Assistant)
+        );
+        assert_eq!(
+            first_choice_one.inner.choices[0].delta.role,
+            Some(dynamo_protocols::types::Role::Assistant)
+        );
+        assert_eq!(second_choice_zero.inner.choices[0].delta.role, None);
+        assert_eq!(second_choice_one.inner.choices[0].delta.role, None);
+    }
+
+    #[test]
+    fn test_chat_logprobs_include_backend_token_id() {
+        let mut request = create_test_request();
+        request.inner.logprobs = Some(true);
+        let mut generator = request.response_generator("req-logprob-token-id".to_string());
+        let mut output = final_backend_output();
+        output.log_probs = Some(vec![-0.5]);
+        output.top_logprobs = Some(vec![vec![]]);
+
+        let response = generator
+            .choice_from_postprocessor(output)
+            .expect("choice generation");
+
+        let logprob = &response.inner.choices[0]
+            .logprobs
+            .as_ref()
+            .expect("logprobs")
+            .content
+            .as_ref()
+            .expect("logprob content")[0];
+        assert_eq!(logprob.token_id, Some(1));
+
+        let response_json = serde_json::to_value(response).expect("serialize response");
+        assert_eq!(
+            response_json["choices"][0]["logprobs"]["content"][0]["token_id"],
+            1
+        );
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {
@@ -494,7 +595,7 @@ mod tests {
             },
             common: Default::default(),
             nvext: Some(
-                crate::protocols::openai::nvext::NvExt::builder()
+                crate::protocols::common::extensions::NvExt::builder()
                     .extra_fields(fields)
                     .build()
                     .unwrap(),
@@ -521,6 +622,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            encoder_result: None,
             worker_trace_link: None,
             engine_data: Some(serde_json::json!({
                 "kv_transfer_time_ms": 12.3,
@@ -580,7 +682,7 @@ mod tests {
 
     #[test]
     fn test_timing_extra_field_emits_timing_on_final_chunk() {
-        use crate::protocols::openai::nvext::NvExt;
+        use crate::protocols::common::extensions::NvExt;
         let nvext = NvExt::builder()
             .extra_fields(vec!["timing".to_string()])
             .build()
@@ -604,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_query_instance_id_emits_worker_id_and_token_ids() {
-        use crate::protocols::openai::nvext::NvExt;
+        use crate::protocols::common::extensions::NvExt;
         let nvext = NvExt::builder()
             .annotations(vec!["query_instance_id:abc".to_string()])
             .build()
@@ -614,6 +716,11 @@ mod tests {
         generator
             .tracker()
             .record_worker(42, Some(0), WORKER_TYPE_PREFILL);
+        // The query-only tokenized prompt reaches the delta generator via the tracker,
+        // mirroring the standalone-router round-trip the preprocessor drains.
+        generator
+            .tracker()
+            .set_external_query_token_ids(vec![11, 22, 33]);
 
         let response = generator
             .choice_from_postprocessor(final_backend_output())
@@ -634,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_routed_experts_extra_field_emits_routed_experts() {
-        use crate::protocols::openai::nvext::NvExt;
+        use crate::protocols::common::extensions::NvExt;
         let nvext = NvExt::builder()
             .extra_fields(vec!["routed_experts".to_string()])
             .build()
@@ -731,6 +838,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            encoder_result: None,
             worker_trace_link: None,
             engine_data: None, // engine didn't provide any data
             routing_data: None,

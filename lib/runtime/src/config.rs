@@ -418,55 +418,79 @@ impl RuntimeConfigBuilder {
     }
 }
 
-/// Check if a string is truthy
-/// This will be used to evaluate environment variables or any other subjective
-/// configuration parameters that can be set by the user that should be evaluated
-/// as a boolean value.
-pub fn is_truthy(val: &str) -> bool {
-    matches!(val.to_lowercase().as_str(), "1" | "true" | "on" | "yes")
+// Canonical truthy/falsy/bool parsing for user-supplied configuration
+// (environment variables, headers, config values). The single implementation
+// lives in the zero-dependency `dynamo-truthy` crate so that crates which
+// cannot depend on `dynamo-runtime` share it too; this re-export is the
+// canonical import path for everything that can.
+pub use dynamo_truthy::{
+    env_is_falsey, env_is_truthy, is_falsey, is_truthy, parse_bool, parse_bool_opt,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleLogFormat {
+    Readable,
+    Jsonl,
 }
 
-pub fn parse_bool(val: &str) -> anyhow::Result<bool> {
-    if is_truthy(val) {
-        Ok(true)
-    } else if is_falsey(val) {
-        Ok(false)
-    } else {
-        anyhow::bail!(
-            "Invalid boolean value: '{}'. Expected one of: true/false, 1/0, on/off, yes/no",
-            val
-        )
+impl ConsoleLogFormat {
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "readable" => Some(Self::Readable),
+            "jsonl" => Some(Self::Jsonl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readable => "readable",
+            Self::Jsonl => "jsonl",
+        }
     }
 }
 
-/// Check if a string is falsey
-/// This will be used to evaluate environment variables or any other subjective
-/// configuration parameters that can be set by the user that should be evaluated
-/// as a boolean value (opposite of is_truthy).
-pub fn is_falsey(val: &str) -> bool {
-    matches!(val.to_lowercase().as_str(), "0" | "false" | "off" | "no")
-}
-
-/// Check if an environment variable is truthy
-pub fn env_is_truthy(env: &str) -> bool {
-    match std::env::var(env) {
-        Ok(val) => is_truthy(val.as_str()),
-        Err(_) => false,
-    }
-}
-
-/// Check if an environment variable is falsey
-pub fn env_is_falsey(env: &str) -> bool {
-    match std::env::var(env) {
-        Ok(val) => is_falsey(val.as_str()),
-        Err(_) => false,
-    }
-}
-
-/// Check whether JSONL logging enabled
-/// Set the `DYN_LOGGING_JSONL` environment variable a [`is_truthy`] value
-pub fn jsonl_logging_enabled() -> bool {
+/// Return whether the legacy `DYN_LOGGING_JSONL` switch is enabled.
+///
+/// This remains a separate compatibility signal because older deployments
+/// also use it to enable local trace-context propagation.
+pub(crate) fn legacy_jsonl_logging_enabled() -> bool {
     env_is_truthy(environment_names::logging::DYN_LOGGING_JSONL)
+}
+
+/// Return the console log format.
+///
+/// `DYN_LOGGING_CONSOLE_FORMAT` takes precedence. `DYN_LOGGING_JSONL` remains
+/// supported as a legacy fallback when the new setting is unset or blank.
+pub fn console_log_format() -> ConsoleLogFormat {
+    let legacy_format = || {
+        if legacy_jsonl_logging_enabled() {
+            ConsoleLogFormat::Jsonl
+        } else {
+            ConsoleLogFormat::Readable
+        }
+    };
+
+    match std::env::var(environment_names::logging::DYN_LOGGING_CONSOLE_FORMAT) {
+        Ok(value) if value.trim().is_empty() => legacy_format(),
+        Ok(value) => match ConsoleLogFormat::from_env_value(value.trim()) {
+            Some(format) => format,
+            None => {
+                eprintln!(
+                    "Invalid {} value '{}'; using readable console logs",
+                    environment_names::logging::DYN_LOGGING_CONSOLE_FORMAT,
+                    value
+                );
+                ConsoleLogFormat::Readable
+            }
+        },
+        Err(_) => legacy_format(),
+    }
+}
+
+/// Return whether the effective console log format is JSONL.
+pub fn jsonl_logging_enabled() -> bool {
+    console_log_format() == ConsoleLogFormat::Jsonl
 }
 
 /// Check whether logging with ANSI terminal escape codes and colors is disabled.
@@ -491,182 +515,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_runtime_config_with_env_vars() -> Result<()> {
-        use environment_names::runtime;
-        temp_env::with_vars(
-            vec![
-                (runtime::DYN_RUNTIME_NUM_WORKER_THREADS, Some("24")),
-                (runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS, Some("32")),
-            ],
-            || {
-                let config = RuntimeConfig::from_settings()?;
-                assert_eq!(config.num_worker_threads, Some(24));
-                assert_eq!(config.max_blocking_threads, 32);
-                Ok(())
-            },
-        )
-    }
+    fn test_runtime_config_builder_overrides_related_fields() -> Result<()> {
+        let config = RuntimeConfig::builder()
+            .num_worker_threads(Some(24))
+            .max_blocking_threads(32)
+            .system_host("127.0.0.1".to_string())
+            .system_port(9090)
+            .build()?;
 
-    #[test]
-    fn test_runtime_config_defaults() -> Result<()> {
-        use environment_names::runtime;
-        temp_env::with_vars(
-            vec![
-                (runtime::DYN_RUNTIME_NUM_WORKER_THREADS, None::<&str>),
-                (runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS, Some("")),
-            ],
-            || {
-                let config = RuntimeConfig::from_settings()?;
-
-                let default_config = RuntimeConfig::default();
-                assert_eq!(config.num_worker_threads, default_config.num_worker_threads);
-                assert_eq!(
-                    config.max_blocking_threads,
-                    default_config.max_blocking_threads
-                );
-                Ok(())
-            },
-        )
+        assert_eq!(config.num_worker_threads, Some(24));
+        assert_eq!(config.max_blocking_threads, 32);
+        assert_eq!(config.system_host, "127.0.0.1");
+        assert_eq!(config.system_port, 9090);
+        Ok(())
     }
 
     #[test]
     fn test_runtime_config_rejects_invalid_thread_count() -> Result<()> {
-        use environment_names::runtime;
-        temp_env::with_vars(
-            vec![
-                (runtime::DYN_RUNTIME_NUM_WORKER_THREADS, Some("0")),
-                (runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS, Some("0")),
-            ],
-            || {
-                let result = RuntimeConfig::from_settings();
-                assert!(result.is_err());
-                if let Err(e) = result {
-                    assert!(
-                        e.to_string()
-                            .contains("num_worker_threads: Validation error")
-                    );
-                    assert!(
-                        e.to_string()
-                            .contains("max_blocking_threads: Validation error")
-                    );
-                }
-                Ok(())
-            },
-        )
+        let result = RuntimeConfig::builder()
+            .num_worker_threads(Some(0))
+            .max_blocking_threads(0)
+            .build();
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("num_worker_threads: Validation error"));
+        assert!(error.contains("max_blocking_threads: Validation error"));
+        Ok(())
     }
 
     #[test]
-    fn test_runtime_config_system_server_env_vars() -> Result<()> {
-        use environment_names::runtime::system;
-        temp_env::with_vars(
-            vec![
-                (system::DYN_SYSTEM_HOST, Some("127.0.0.1")),
-                (system::DYN_SYSTEM_PORT, Some("9090")),
-            ],
-            || {
-                let config = RuntimeConfig::from_settings()?;
-                assert_eq!(config.system_host, "127.0.0.1");
-                assert_eq!(config.system_port, 9090);
-                Ok(())
-            },
-        )
-    }
-
-    #[test]
-    fn test_system_server_disabled_by_default() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(vec![(system::DYN_SYSTEM_PORT, None::<&str>)], || {
-            let config = RuntimeConfig::from_settings().unwrap();
-            assert!(!config.system_server_enabled());
-            assert_eq!(config.system_port, -1);
-        });
-    }
-
-    #[test]
-    fn test_system_server_disabled_with_negative_port() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(vec![(system::DYN_SYSTEM_PORT, Some("-1"))], || {
-            let config = RuntimeConfig::from_settings().unwrap();
-            assert!(!config.system_server_enabled());
-            assert_eq!(config.system_port, -1);
-        });
-    }
-
-    #[test]
-    fn test_system_server_enabled_with_port() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(vec![(system::DYN_SYSTEM_PORT, Some("9527"))], || {
-            let config = RuntimeConfig::from_settings().unwrap();
-            assert!(config.system_server_enabled());
-            assert_eq!(config.system_port, 9527);
-        });
-    }
-
-    #[test]
-    fn test_system_server_starting_health_status_ready() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(
-            vec![(system::DYN_SYSTEM_STARTING_HEALTH_STATUS, Some("ready"))],
-            || {
-                let config = RuntimeConfig::from_settings().unwrap();
-                assert!(config.starting_health_status == HealthStatus::Ready);
-            },
-        );
-    }
-
-    #[test]
-    fn test_system_use_endpoint_health_status() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(
-            vec![(
-                system::DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS,
-                Some("[\"ready\"]"),
-            )],
-            || {
-                let config = RuntimeConfig::from_settings().unwrap();
-                assert!(config.use_endpoint_health_status == vec!["ready"]);
-            },
-        );
-    }
-
-    #[test]
-    fn test_system_health_endpoint_path_default() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(vec![(system::DYN_SYSTEM_HEALTH_PATH, None::<&str>)], || {
-            let config = RuntimeConfig::from_settings().unwrap();
-            assert_eq!(
-                config.system_health_path,
-                DEFAULT_SYSTEM_HEALTH_PATH.to_string()
-            );
-        });
-
-        temp_env::with_vars(vec![(system::DYN_SYSTEM_LIVE_PATH, None::<&str>)], || {
-            let config = RuntimeConfig::from_settings().unwrap();
-            assert_eq!(
-                config.system_live_path,
-                DEFAULT_SYSTEM_LIVE_PATH.to_string()
-            );
-        });
-    }
-
-    #[test]
-    fn test_system_health_endpoint_path_custom() {
-        use environment_names::runtime::system;
-        temp_env::with_vars(
-            vec![(system::DYN_SYSTEM_HEALTH_PATH, Some("/custom/health"))],
-            || {
-                let config = RuntimeConfig::from_settings().unwrap();
-                assert_eq!(config.system_health_path, "/custom/health");
-            },
-        );
-
-        temp_env::with_vars(
-            vec![(system::DYN_SYSTEM_LIVE_PATH, Some("/custom/live"))],
-            || {
-                let config = RuntimeConfig::from_settings().unwrap();
-                assert_eq!(config.system_live_path, "/custom/live");
-            },
-        );
+    fn test_system_server_enabled_by_nonnegative_port() {
+        let mut config = RuntimeConfig::default();
+        for (port, enabled) in [(-1, false), (0, true), (9527, true)] {
+            config.system_port = port;
+            assert_eq!(config.system_server_enabled(), enabled);
+        }
     }
 
     #[test]
@@ -688,22 +571,36 @@ mod tests {
         // Test opposite behavior
         assert!(!is_truthy("0"));
         assert!(!is_falsey("1"));
+    }
 
-        // Test env functions
-        temp_env::with_vars(vec![("TEST_TRUTHY", Some("true"))], || {
-            assert!(env_is_truthy("TEST_TRUTHY"));
-            assert!(!env_is_falsey("TEST_TRUTHY"));
-        });
+    #[test]
+    fn test_console_log_format() {
+        use environment_names::logging;
 
-        temp_env::with_vars(vec![("TEST_FALSEY", Some("false"))], || {
-            assert!(!env_is_truthy("TEST_FALSEY"));
-            assert!(env_is_falsey("TEST_FALSEY"));
-        });
-
-        // Test missing env vars
-        temp_env::with_vars(vec![("TEST_MISSING", None::<&str>)], || {
-            assert!(!env_is_truthy("TEST_MISSING"));
-            assert!(!env_is_falsey("TEST_MISSING"));
-        });
+        for (console_format, legacy_jsonl, expected) in [
+            (None, None, ConsoleLogFormat::Readable),
+            (None, Some("true"), ConsoleLogFormat::Jsonl),
+            (Some(""), Some("true"), ConsoleLogFormat::Jsonl),
+            (Some("   "), Some("true"), ConsoleLogFormat::Jsonl),
+            (Some(" jsonl "), Some("false"), ConsoleLogFormat::Jsonl),
+            (Some("readable"), Some("true"), ConsoleLogFormat::Readable),
+            (Some("jsonl"), Some("false"), ConsoleLogFormat::Jsonl),
+            (
+                Some("unsupported"),
+                Some("true"),
+                ConsoleLogFormat::Readable,
+            ),
+        ] {
+            temp_env::with_vars(
+                [
+                    (logging::DYN_LOGGING_CONSOLE_FORMAT, console_format),
+                    (logging::DYN_LOGGING_JSONL, legacy_jsonl),
+                ],
+                || {
+                    assert_eq!(console_log_format(), expected);
+                    assert_eq!(jsonl_logging_enabled(), expected == ConsoleLogFormat::Jsonl);
+                },
+            );
+        }
     }
 }

@@ -4,8 +4,8 @@
 
 """Load-based scaling logic (FPM-driven, reactive).
 
-Mixin consumed by ``PlannerStateMachine``.  All methods access state
-via ``self._config``, ``self._capabilities``, and perf models.
+Mixin consumed by ``PlannerScalingState``.  All methods access state via
+``self._config``, ``self._capabilities``, and perf models.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from dynamo.planner.config.planner_config import resolve_min_endpoint
 from dynamo.planner.core.types import FpmObservations, ScalingDecision
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ _DECODE_LATENCY_SCALE_DOWN = 0.1  # util < 10%
 class LoadScalingMixin:
     """FPM-driven load-based scaling decisions."""
 
-    # Scratch fields owned by PlannerStateMachine, declared here for mypy
+    # Scratch fields owned by PlannerScalingState, declared here for mypy
     _diag_estimated_ttft_ms: Optional[float]
     _diag_estimated_itl_ms: Optional[float]
     _diag_load_reason: Optional[str]
@@ -198,8 +199,8 @@ class LoadScalingMixin:
             final_d = max(final_d, self._throughput_lower_bound_d)
         post_floor_p, post_floor_d = final_p, final_d
 
-        final_p = max(final_p, self._config.min_endpoint)
-        final_d = max(final_d, self._config.min_endpoint)
+        final_p = max(final_p, resolve_min_endpoint(self._config, "prefill"))
+        final_d = max(final_d, resolve_min_endpoint(self._config, "decode"))
         final_p, final_d = self._apply_global_budget(final_p, final_d)
 
         # Per-component reasons
@@ -285,7 +286,7 @@ class LoadScalingMixin:
                 return None
 
             original_desired = desired
-            desired = max(desired, self._config.min_endpoint)
+            desired = max(desired, resolve_min_endpoint(self._config, "decode"))
             if self._config.enable_throughput_scaling:
                 desired = max(desired, self._throughput_lower_bound_d)
             desired = self._apply_single_budget(desired, "decode")
@@ -353,7 +354,7 @@ class LoadScalingMixin:
             desired = num_workers
 
         original_desired = desired
-        desired = max(desired, self._config.min_endpoint)
+        desired = max(desired, resolve_min_endpoint(self._config, "decode"))
         if self._config.enable_throughput_scaling:
             desired = max(desired, self._throughput_lower_bound_d)
         desired = self._apply_single_budget(desired, "decode")
@@ -478,6 +479,7 @@ class LoadScalingMixin:
             self._config.ttft_ms,
             num_workers,
             "prefill TTFT",
+            resolve_min_endpoint(self._config, "prefill"),
             can_scale_down=can_scale_down,
         )
         if decision is None and consolidation_refused:
@@ -502,6 +504,7 @@ class LoadScalingMixin:
         consolidation = num_workers / (num_workers - 1) if num_workers > 1 else 1.0
         d_caps = self._capabilities.decode
         max_kv = d_caps.max_kv_tokens if d_caps else None
+        accept_length = self._current_decode_accept_length()
 
         estimates: list[float] = []
         # Consolidation-aware scale-down. Two safety checks per worker:
@@ -522,11 +525,12 @@ class LoadScalingMixin:
                 include_queued_decode=True,
             )
             if est is not None:
-                est_ms = est * 1000
+                est_ms = est * 1000 / accept_length
                 estimates.append(est_ms)
                 logger.info(
                     f"Decode engine {label}: estimated ITL {est_ms:.2f}ms "
-                    f"(sched_kv={sched_kv}, queued_kv={queued_kv})"
+                    f"(sched_kv={sched_kv}, queued_kv={queued_kv}, "
+                    f"accept_length={accept_length:.2f})"
                 )
 
             if can_scale_down:
@@ -544,7 +548,9 @@ class LoadScalingMixin:
                 )
                 if post_itl is None:
                     can_scale_down = False
-                elif post_itl * 1000 >= self._config.itl_ms * sensitivity:
+                elif (
+                    post_itl * 1000 / accept_length >= self._config.itl_ms * sensitivity
+                ):
                     can_scale_down = False
                     consolidation_refused = True
 
@@ -556,6 +562,7 @@ class LoadScalingMixin:
             self._config.itl_ms,
             num_workers,
             "decode ITL",
+            resolve_min_endpoint(self._config, "decode"),
             can_scale_down=can_scale_down,
         )
         if decision is None and consolidation_refused:
@@ -631,6 +638,7 @@ class LoadScalingMixin:
             self._config.ttft_ms,
             num_workers,
             "agg TTFT",
+            resolve_min_endpoint(self._config, "decode"),
             can_scale_down=can_scale_down,
         )
         if decision is None and consolidation_refused:
@@ -650,6 +658,7 @@ class LoadScalingMixin:
         consolidation = num_workers / (num_workers - 1) if num_workers > 1 else 1.0
         d_caps = self._capabilities.decode
         max_kv = d_caps.max_kv_tokens if d_caps else None
+        accept_length = self._current_decode_accept_length()
 
         estimates: list[float] = []
         # Agg-decode consolidation. Combined cache pressure (sched_decode_kv
@@ -672,7 +681,7 @@ class LoadScalingMixin:
                 include_queued_decode=True,
             )
             if est is not None:
-                estimates.append(est * 1000)
+                estimates.append(est * 1000 / accept_length)
 
             if can_scale_down:
                 post_combined_kv = int(
@@ -692,7 +701,9 @@ class LoadScalingMixin:
                 )
                 if post_itl is None:
                     can_scale_down = False
-                elif post_itl * 1000 >= self._config.itl_ms * sensitivity:
+                elif (
+                    post_itl * 1000 / accept_length >= self._config.itl_ms * sensitivity
+                ):
                     can_scale_down = False
                     consolidation_refused = True
 
@@ -704,6 +715,7 @@ class LoadScalingMixin:
             self._config.itl_ms,
             num_workers,
             "agg ITL",
+            resolve_min_endpoint(self._config, "decode"),
             can_scale_down=can_scale_down,
         )
         if decision is None and consolidation_refused:
@@ -792,7 +804,10 @@ class LoadScalingMixin:
         if num_workers > 1:
             if is_load:
                 if all(v <= down_thresh for v in values):
-                    desired = max(num_workers - 1, self._config.min_endpoint)
+                    desired = max(
+                        num_workers - 1,
+                        resolve_min_endpoint(self._config, "prefill"),
+                    )
                     logger.info(
                         f"Load prefill: all engines at or below scale-down "
                         f"threshold ({down_thresh}), -> {desired}"
@@ -801,14 +816,20 @@ class LoadScalingMixin:
             elif is_latency:
                 # For latency mode, scale down when ALL queues are empty
                 if all(v <= down_thresh for v in values):
-                    desired = max(num_workers - 1, self._config.min_endpoint)
+                    desired = max(
+                        num_workers - 1,
+                        resolve_min_endpoint(self._config, "prefill"),
+                    )
                     logger.info(
                         f"Easy prefill: all engines at zero queue, -> {desired}"
                     )
                     return desired
             else:
                 if all(v < down_thresh for v in values):
-                    desired = max(num_workers - 1, self._config.min_endpoint)
+                    desired = max(
+                        num_workers - 1,
+                        resolve_min_endpoint(self._config, "prefill"),
+                    )
                     logger.info(
                         f"Easy prefill: all engines below scale-down threshold "
                         f"({down_thresh}), -> {desired}"
@@ -884,7 +905,7 @@ class LoadScalingMixin:
             else all(u < down_thresh for u in utils)
         )
         if num_workers > 1 and scale_down:
-            desired = max(num_workers - 1, self._config.min_endpoint)
+            desired = max(num_workers - 1, resolve_min_endpoint(self._config, "decode"))
             logger.info(
                 f"Easy decode: all engines below scale-down threshold "
                 f"({down_thresh}), -> {desired}"
@@ -962,7 +983,7 @@ class LoadScalingMixin:
             else all(u < down_thresh for u in utils)
         )
         if num_workers > 1 and scale_down:
-            desired = max(num_workers - 1, self._config.min_endpoint)
+            desired = max(num_workers - 1, resolve_min_endpoint(self._config, "decode"))
             logger.info(
                 f"Easy agg: all engines below scale-down threshold "
                 f"({down_thresh}), -> {desired}"
@@ -982,6 +1003,7 @@ class LoadScalingMixin:
         sla: float,
         num_workers: int,
         label: str,
+        min_endpoint: int,
         *,
         can_scale_down: bool,
     ) -> Optional[int]:
@@ -1018,7 +1040,7 @@ class LoadScalingMixin:
             return num_workers + 1
 
         if num_workers > 1 and can_scale_down:
-            desired = max(num_workers - 1, self._config.min_endpoint)
+            desired = max(num_workers - 1, min_endpoint)
             logger.info(
                 f"Load-based {label}: post-consolidation prediction within "
                 f"sensitivity, -> {desired}"

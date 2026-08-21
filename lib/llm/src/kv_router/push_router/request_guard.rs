@@ -3,70 +3,85 @@
 
 use std::sync::Arc;
 
+use dynamo_kv_router::{protocols::WorkerWithDpRank, selector::WorkerSelector};
 use dynamo_runtime::{
+    error::DynamoError,
     metrics::frontend_perf::{STAGE_DISPATCH, StageGuard},
     protocols::annotated::Annotated,
 };
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics, sticky::lifecycle::SessionCloseAction},
+    kv_router::{KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector},
+    local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
+        preprocessor::MigrationState,
         timing::{RequestPhase, RequestTracker},
     },
 };
 
-/// Owns resources that must be released even when routing setup or streaming is cancelled.
-struct RequestCleanup {
-    chooser: Arc<KvRouter>,
+/// Owns scheduler cleanup after a worker is selected.
+///
+/// `worker` is captured at construction so cleanup targets the booking this
+/// guard acquired, even if cleanup is delayed.
+struct RequestCleanup<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    chooser: Arc<KvRouter<Sel>>,
     context_id: String,
+    worker: WorkerWithDpRank,
     scheduler_tracked: bool,
     freed: bool,
-    deferred_close: Option<SessionCloseAction>,
 }
 
-impl RequestCleanup {
-    fn new(chooser: Arc<KvRouter>, context_id: String, scheduler_tracked: bool) -> Self {
+impl<Sel> RequestCleanup<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    fn new(
+        chooser: Arc<KvRouter<Sel>>,
+        context_id: String,
+        worker: WorkerWithDpRank,
+        scheduler_tracked: bool,
+    ) -> Self {
         Self {
             chooser,
             context_id,
+            worker,
             scheduler_tracked,
             freed: false,
-            deferred_close: None,
         }
     }
 
-    fn set_deferred_close(&mut self, deferred_close: Option<SessionCloseAction>) {
-        self.deferred_close = deferred_close;
-    }
-
     async fn finish(&mut self) {
-        // Free scheduler state before closing the session so both explicit and
-        // drop cleanup preserve the same lifecycle ordering.
+        if self.freed {
+            return;
+        }
         if self.scheduler_tracked
-            && let Err(error) = self.chooser.free(&self.context_id).await
+            && let Err(error) = self
+                .chooser
+                .free_if_worker(&self.context_id, self.worker)
+                .await
         {
             tracing::warn!(
                 request_id = %self.context_id,
+                worker = ?self.worker,
                 %error,
                 "Failed to free request"
             );
         }
         self.freed = true;
-
-        if let Some(close) = self.deferred_close.take() {
-            close.execute(&self.context_id);
-        }
     }
 }
 
-impl Drop for RequestCleanup {
+impl<Sel> Drop for RequestCleanup<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     fn drop(&mut self) {
-        // Drop cannot await, so transfer any unfinished cleanup into one task.
-        let deferred_close = self.deferred_close.take();
-        let needs_free = !self.freed && self.scheduler_tracked;
-        if deferred_close.is_none() && !needs_free {
+        if self.freed || !self.scheduler_tracked {
             return;
         }
 
@@ -80,17 +95,16 @@ impl Drop for RequestCleanup {
 
         let chooser = self.chooser.clone();
         let context_id = self.context_id.clone();
+        let worker = self.worker;
         handle.spawn(async move {
-            // Match explicit finish ordering so session KV closes after scheduler cleanup.
-            if needs_free && let Err(error) = chooser.free(&context_id).await {
+            let result = chooser.free_if_worker(&context_id, worker).await;
+            if let Err(error) = result {
                 tracing::warn!(
                     request_id = %context_id,
+                    ?worker,
                     %error,
                     "Failed to free request from drop guard"
                 );
-            }
-            if let Some(close) = deferred_close {
-                close.execute(&context_id);
             }
         });
     }
@@ -257,18 +271,30 @@ impl OutputBlockTracker {
     }
 }
 
-/// Coordinates scheduler/session cleanup, observability, and streamed load tracking.
-pub(super) struct RequestGuard {
-    cleanup: RequestCleanup,
+/// Coordinates scheduler cleanup, observability, and streamed load tracking.
+///
+/// Session-affinity lifetime is separate: `AffinityAcquire` and
+/// `AffinityLease` own binding commit, release, and invalidation.
+pub(super) struct RequestGuard<Sel = DefaultWorkerSelector>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    cleanup: RequestCleanup<Sel>,
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
+    migration_state: Option<MigrationState>,
 }
 
-impl RequestGuard {
+impl<Sel> RequestGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     pub(super) fn new(
-        chooser: Arc<KvRouter>,
+        chooser: Arc<KvRouter<Sel>>,
+        request_metrics: Arc<RouterRequestMetrics>,
         context_id: String,
+        worker: WorkerWithDpRank,
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
     ) -> Self {
@@ -282,11 +308,12 @@ impl RequestGuard {
             .and_then(|routing| routing.expected_output_tokens);
         let track_output_blocks =
             scheduler_tracked && chooser.kv_router_config().router_track_output_blocks;
-        let request_metrics =
-            RouterRequestMetrics::from_component(chooser.client().endpoint.component());
+        if scheduler_tracked {
+            request_metrics.requests_started_total().inc();
+        }
 
         Self {
-            cleanup: RequestCleanup::new(chooser, context_id, scheduler_tracked),
+            cleanup: RequestCleanup::new(chooser, context_id, worker, scheduler_tracked),
             observability: RequestObservability::new(request.tracker.clone(), request_metrics),
             output_blocks: OutputBlockTracker::new(
                 track_output_blocks,
@@ -295,6 +322,13 @@ impl RequestGuard {
                 expected_output_tokens,
             ),
             prefill_marked: false,
+            migration_state: request.migration_state.clone(),
+        }
+    }
+
+    pub(super) fn record_migration_failure(&self, error: Option<DynamoError>) {
+        if let Some(state) = self.migration_state.as_ref() {
+            state.record_failure(self.cleanup.worker.worker_id, error);
         }
     }
 
@@ -304,10 +338,6 @@ impl RequestGuard {
 
     pub(super) fn start_dispatch(&mut self, phase_label: &str) {
         self.observability.start_dispatch(phase_label);
-    }
-
-    pub(super) fn set_deferred_close(&mut self, deferred_close: Option<SessionCloseAction>) {
-        self.cleanup.set_deferred_close(deferred_close);
     }
 
     pub(super) fn record_prefill_start(&self) {
@@ -346,10 +376,8 @@ impl RequestGuard {
 
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
         self.observability.observe_tokens(new_tokens);
-        let Some(update) = self
-            .output_blocks
-            .observe(self.observability.cumulative_osl())
-        else {
+        let cumulative_osl = self.observability.cumulative_osl();
+        let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
         };
 
@@ -373,9 +401,16 @@ impl RequestGuard {
         self.observability.record_metrics();
         self.cleanup.finish().await;
     }
+
+    pub(super) async fn abort(&mut self) {
+        self.cleanup.finish().await;
+    }
 }
 
-impl Drop for RequestGuard {
+impl<Sel> Drop for RequestGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     fn drop(&mut self) {
         // RequestCleanup drops immediately afterward and performs resource cleanup.
         self.observability.record_metrics();

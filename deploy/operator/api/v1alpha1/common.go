@@ -22,8 +22,51 @@ import (
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// ProviderOverride carries a sparse provider-native fragment for its DGD context.
+// Grove support is restricted as follows:
+//   - apiVersion must be `grove.io/v1alpha1`.
+//   - target is `PodCliqueSet`, `PodCliqueTemplateSpec`, or
+//     `PodCliqueScalingGroupConfig`, according to the field location and
+//     component shape.
+//   - value may set only the target's topologyConstraint subtree.
+//
+// All other providers, versions, targets, and fields are rejected.
+type ProviderOverride struct {
+	// apiVersion is the Kubernetes API group and version of the provider schema.
+	// Grove requires `grove.io/v1alpha1`.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	APIVersion string `json:"apiVersion"`
+
+	// target identifies the provider resource kind or embedded provider schema.
+	// It may be omitted on input when the DGD location has one unambiguous target;
+	// admission resolves and persists it.
+	// +optional
+	Target string `json:"target,omitempty"`
+
+	// value is a sparse fragment of the selected provider schema. For Grove,
+	// PodCliqueSet accepts only `spec.template.topologyConstraint`; embedded
+	// PodCliqueTemplateSpec and PodCliqueScalingGroupConfig targets accept only
+	// `topologyConstraint`.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	Value apiextensionsv1.JSON `json:"value"`
+}
+
+// MultinodeRoleSpec configures one explicit role of a multinode component.
+type MultinodeRoleSpec struct {
+	// providerOverride configures the Grove PCLQ template generated for this
+	// multinode role. It uses apiVersion `grove.io/v1alpha1`, target
+	// `PodCliqueTemplateSpec`, and may set only `topologyConstraint`. It is
+	// supported only for components embedded in a DGD.
+	// +optional
+	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
+}
 
 // +kubebuilder:validation:XValidation:rule="!has(self.create) || self.create == false || (has(self.size) && has(self.storageClass) && has(self.volumeAccessMode))",message="When create is true, size, storageClass, and volumeAccessMode are required"
 type PVC struct {
@@ -196,8 +239,7 @@ type GPUMemoryServiceSpec struct {
 	// DGD/DCD services apply this to service pods. Auto-created checkpoints
 	// apply checkpoint job clients before creating the DynamoCheckpoint; manual
 	// DynamoCheckpoint users must provide an already-prepared pod template.
-	// In each rendered pod, only matching container names are wired; absent
-	// names are ignored.
+	// Every name must match a user-declared container in the enclosing pod spec.
 	// +optional
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
@@ -256,25 +298,31 @@ type FailoverSpec struct {
 }
 
 // ScalingAdapter configures whether a service uses the DynamoGraphDeploymentScalingAdapter
-// for replica management. When enabled, the DGDSA owns the replicas field and
-// external autoscalers (HPA, KEDA, Planner) can control scaling via the Scale subresource.
+// (DGDSA) for replica management. When enabled, the DGDSA owns the replicas field so that
+// external autoscalers (HPA, KEDA, Planner) can drive scaling via the Scale subresource.
+//
+// Enable it with `scalingAdapter: {enabled: true}`. Because `enabled` defaults to false, a
+// bare `scalingAdapter: {}` is disabled.
 type ScalingAdapter struct {
-	// Enabled indicates whether the ScalingAdapter should be enabled for this service.
-	// When true, a DGDSA is created and owns the replicas field.
-	// When false (default), no DGDSA is created and replicas can be modified directly in the DGD.
+	// Enabled turns the ScalingAdapter on for this service. When true, a DGDSA is created and
+	// owns the replicas field. When false (the default), no DGDSA is created and replicas are
+	// set directly on the DGD -- so a bare `scalingAdapter: {}` is disabled; set
+	// `enabled: true` to opt in.
 	// +optional
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 }
 
-// CheckpointMode defines how checkpoint creation is handled
+// Deprecated: use checkpoint.enabled instead.
+// enabled=true without checkpointRef creates a DGD-managed automatic
+// checkpoint; checkpointRef restores the named checkpoint.
 // +kubebuilder:validation:Enum=Auto;Manual
 type CheckpointMode string
 
 const (
-	// CheckpointModeAuto means the DGD controller will automatically create a Checkpoint CR
+	// Deprecated: use checkpoint.enabled=true and omit checkpointRef.
 	CheckpointModeAuto CheckpointMode = "Auto"
-	// CheckpointModeManual means the user must create the Checkpoint CR themselves
+	// Deprecated: use checkpointRef to restore an existing checkpoint.
 	CheckpointModeManual CheckpointMode = "Manual"
 )
 
@@ -309,18 +357,16 @@ const (
 
 // ServiceCheckpointConfig configures checkpointing for a DGD service
 // +kubebuilder:validation:XValidation:rule="!has(self.job) || !has(self.checkpointRef) || size(self.checkpointRef) == 0",message="checkpoint.job cannot be set when checkpointRef is specified"
-// +kubebuilder:validation:XValidation:rule="!has(self.job) || !has(self.mode) || self.mode == 'Auto'",message="checkpoint.job can only be set in Auto mode"
 type ServiceCheckpointConfig struct {
 	// Enabled indicates whether checkpointing is enabled for this service
 	// +optional
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Mode defines how checkpoint creation is handled
-	// - Auto: DGD controller creates Checkpoint CR automatically
-	// - Manual: User must create Checkpoint CR
+	// Deprecated: omit mode. Use enabled=true without checkpointRef for a
+	// DGD-managed automatic checkpoint, or use checkpointRef to restore the
+	// named checkpoint.
 	// +optional
-	// +kubebuilder:default=Auto
 	Mode CheckpointMode `json:"mode,omitempty"`
 
 	// StartupPolicy defines when normal worker replicas are started relative to
@@ -345,9 +391,8 @@ type ServiceCheckpointConfig struct {
 	// +optional
 	CheckpointRef *string `json:"checkpointRef,omitempty"`
 
-	// Deprecated: Identity is ignored by DGD-managed automatic checkpoints.
-	// Automatic checkpoints are scoped to the owning DGD/component generation and
-	// are never reused across DGDs.
+	// Deprecated: omit for DGD-managed checkpoints; no action is needed.
+	// Use CheckpointRef to restore an existing checkpoint.
 	// +optional
 	Identity *DynamoCheckpointIdentity `json:"identity,omitempty"`
 
@@ -359,7 +404,7 @@ type ServiceCheckpointConfig struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	TargetContainerName string `json:"targetContainerName,omitempty"`
 
-	// Job customizes the checkpoint Job that is created in Auto mode.
+	// Job customizes the DGD-managed checkpoint Job.
 	// +optional
 	Job *ServiceCheckpointJobConfig `json:"job,omitempty"`
 }
