@@ -31,6 +31,8 @@ use crate::pipeline::network::StreamProvider;
 use crate::pipeline::network::StreamReceiver;
 use crate::pipeline::network::StreamSender;
 use crate::pipeline::network::TwoPartCodec;
+use crate::pipeline::network::WORKER_OVERLOADED_PREFIX;
+use crate::pipeline::network::WORKER_UNAVAILABLE_PREFIX;
 use crate::pipeline::network::codec::TwoPartMessage;
 use crate::pipeline::network::tcp;
 use crate::pipeline::{ManyIn, ManyOut, PipelineError, ResponseStream, SingleIn};
@@ -701,15 +703,13 @@ impl AddressedPushRouter {
 /// Map a worker rejection ACK to the corresponding typed error. `None` for
 /// normal responses, including the empty "queued" ACK.
 fn detect_worker_rejection_response(res_bytes: &[u8]) -> Option<DynamoError> {
-    const OVERLOAD_PREFIX: &[u8] = b"Server overloaded:";
-    const UNAVAILABLE_PREFIX: &[u8] = b"Server unavailable:";
-
-    let error_type = if res_bytes.starts_with(OVERLOAD_PREFIX) {
+    // Prefixes are emitted by ingress::shared_tcp_endpoint as a request-plane ACK wire contract.
+    let error_type = if res_bytes.starts_with(WORKER_OVERLOADED_PREFIX) {
         // This ACK came from the one worker addressed by this dispatch. It says
         // nothing about capacity elsewhere in the eligible pool, so preserve
         // worker scope for migration instead of reporting pool exhaustion.
         ErrorType::WorkerOverloaded
-    } else if res_bytes.starts_with(UNAVAILABLE_PREFIX) {
+    } else if res_bytes.starts_with(WORKER_UNAVAILABLE_PREFIX) {
         ErrorType::Unavailable
     } else {
         return None;

@@ -13,7 +13,9 @@ use crate::metrics::work_handler_pool::{
     WORK_HANDLER_POOL_ACTIVE_TASKS, WORK_HANDLER_POOL_CAPACITY, WORK_HANDLER_QUEUE_CAPACITY,
     WORK_HANDLER_QUEUE_DEPTH,
 };
-use crate::pipeline::network::PushWorkHandler;
+use crate::pipeline::network::{
+    PushWorkHandler, WORKER_OVERLOADED_MESSAGE, WORKER_UNAVAILABLE_MESSAGE,
+};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -741,6 +743,8 @@ impl SharedTcpServer {
             }
 
             // All engine slots busy (or items already queued): try the overflow queue.
+            // Rejection ACKs are a prefix-matched wire contract with
+            // egress::addressed_router::detect_worker_rejection_response.
             match work_tx.try_reserve() {
                 Ok(slot) => {
                     WORK_HANDLER_QUEUE_DEPTH.inc();
@@ -760,7 +764,7 @@ impl SharedTcpServer {
                         "Worker at capacity (engine + queue full), rejecting request"
                     );
                     send_response(TcpResponseMessage::new(Bytes::from_static(
-                        b"Server overloaded: worker at capacity",
+                        WORKER_OVERLOADED_MESSAGE,
                     )));
                     handler.inflight.fetch_sub(1, Ordering::SeqCst);
                     handler.notify.notify_one();
@@ -768,7 +772,7 @@ impl SharedTcpServer {
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     WORK_HANDLER_ENQUEUE_REJECTED_TOTAL.inc();
                     send_response(TcpResponseMessage::new(Bytes::from_static(
-                        b"Server unavailable: worker pool channel closed",
+                        WORKER_UNAVAILABLE_MESSAGE,
                     )));
                     handler.inflight.fetch_sub(1, Ordering::SeqCst);
                     handler.notify.notify_one();

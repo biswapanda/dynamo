@@ -37,8 +37,29 @@ use crate::protocols::maybe_error::MaybeError;
 use ingress::push_handler::WorkHandlerMetrics;
 use prometheus::{CounterVec, Histogram, IntCounter, IntCounterVec, IntGauge};
 
+/// Prefix in the worker-ingress/frontend-egress request-plane ACK wire contract for overloads.
+pub(crate) const WORKER_OVERLOADED_PREFIX: &[u8] = b"Server overloaded:";
+/// Prefix in the worker-ingress/frontend-egress request-plane ACK wire contract for unavailability.
+pub(crate) const WORKER_UNAVAILABLE_PREFIX: &[u8] = b"Server unavailable:";
+/// Full overload message in the worker-ingress/frontend-egress request-plane ACK wire contract.
+pub(crate) const WORKER_OVERLOADED_MESSAGE: &[u8] = b"Server overloaded: worker at capacity";
+/// Full unavailable message in the worker-ingress/frontend-egress request-plane ACK wire contract.
+pub(crate) const WORKER_UNAVAILABLE_MESSAGE: &[u8] =
+    b"Server unavailable: worker pool channel closed";
+
 /// Shared default maximum TCP message size across request-plane components.
 pub(crate) const DEFAULT_TCP_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+mod worker_rejection_contract_tests {
+    use super::*;
+
+    #[test]
+    fn worker_rejection_messages_match_prefixes() {
+        assert!(WORKER_OVERLOADED_MESSAGE.starts_with(WORKER_OVERLOADED_PREFIX));
+        assert!(WORKER_UNAVAILABLE_MESSAGE.starts_with(WORKER_UNAVAILABLE_PREFIX));
+    }
+}
 
 static TCP_MAX_MESSAGE_SIZE: OnceLock<usize> = OnceLock::new();
 static REQUEST_PLANE_PAYLOAD_CODEC: OnceLock<RequestPlanePayloadCodec> = OnceLock::new();
